@@ -1,0 +1,3674 @@
+
+import os
+import hashlib
+import re
+import json
+import math
+import random
+import warnings
+import time
+from pathlib import Path
+from contextlib import nullcontext
+
+import numpy as np
+import pandas as pd
+from PIL import Image
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
+from torchvision import transforms
+
+from tqdm import tqdm
+from sklearn.metrics import (
+    accuracy_score,
+    balanced_accuracy_score,
+    confusion_matrix,
+    precision_recall_fscore_support,
+    roc_auc_score,
+    cohen_kappa_score,
+    matthews_corrcoef,
+    roc_curve,
+    auc,
+)
+
+from scipy.stats import wilcoxon, kruskal, binomtest
+
+
+
+# ================================================================
+# ================================================================
+# 0. CONFIGURATION
+# ================================================================
+
+DATA_ROOT = Path(".")
+AXIAL_DIR =  "ax_AD_CN_MCI"
+CORONAL_DIR =  "cr_AD_CN_MCI"
+
+OUTPUT_DIR = Path("outputs_anatomy_vl")
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# Labels are inferred directly from filenames:
+# AD_ax_20.jpg, CN_ax_20.jpg, MCI_ax_20.jpg
+LABEL_MAP = {"AD": 0, "CN": 1, "MCI": 2}
+CLASS_NAMES = ["AD", "CN", "MCI"]
+
+IMAGE_SIZE = 224
+BATCH_SIZE = 16
+GRAD_ACCUM_STEPS = 1
+NUM_WORKERS = 4
+
+# More training is useful for a model initialized entirely from scratch.
+NUM_EPOCHS = 200
+WARMUP_EPOCHS = 10
+EARLY_STOPPING_PATIENCE = 100
+
+LEARNING_RATE = 2e-4
+TEXT_LEARNING_RATE = 5e-5
+MIN_LR = 1e-6
+WEIGHT_DECAY = 1e-4
+
+# These weights keep the supervised classification objective dominant.
+# Auxiliary semantic objectives are ramped in gradually.
+LAMBDA_REGION_ALIGN = 0.05
+LAMBDA_DISEASE_ALIGN = 0.05
+LAMBDA_REGION_DROPOUT = 0.02
+LAMBDA_SUPCON = 0.10
+SEMANTIC_LOGIT_WEIGHT = 0.10
+TEMPERATURE = 0.10
+
+# Deterministic, pre-specified test-time augmentation. This is not tuned
+# using test labels.
+USE_TTA = True
+
+RUN_SEEDS = [10, 20, 30, 40, 50]
+RUN_REPEATED_EXPERIMENTS = True
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+AMP_ENABLED = DEVICE.type == "cuda"
+
+
+VISION_DIM = 384
+VISION_HEADS = 6
+VISION_MLP_DIM = 1536
+NUM_WINDOW_BLOCKS = 4
+NUM_GLOBAL_BLOCKS = 4
+WINDOW_SIZE = 7
+TEXT_DIM = 384
+
+
+TRAIN_TRANSFORM = transforms.Compose([
+    transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)),
+    transforms.RandomAffine(
+        degrees=5,
+        translate=(0.03, 0.03),
+        scale=(0.95, 1.05),
+        shear=(-2, 2),
+        fill=0,
+    ),
+    transforms.RandomApply([
+        transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 0.8))
+    ], p=0.10),
+    transforms.ToTensor(),
+    transforms.Normalize(
+        mean=[0.5, 0.5, 0.5],
+        std=[0.5, 0.5, 0.5],
+    ),
+])
+
+EVAL_TRANSFORM = transforms.Compose([
+    transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)),
+    transforms.ToTensor(),
+    transforms.Normalize(
+        mean=[0.5, 0.5, 0.5],
+        std=[0.5, 0.5, 0.5],
+    ),
+])
+# 1. REPRODUCIBILITY
+# ================================================================
+
+def seed_everything(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+    # Reproducibility is preferred for the reported experiments.
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+# ================================================================
+# ================================================================
+# 2. IMAGE-LEVEL DATA SPLITTING
+# ================================================================
+
+IMG_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
+
+
+def extract_label(filename):
+    """Extract AD/CN/MCI directly from the filename prefix."""
+    label_name = Path(filename).stem.split("_")[0].upper()
+
+    if label_name not in LABEL_MAP:
+        raise ValueError(
+            f"Cannot infer label from filename: {filename}. "
+            f"Expected filename beginning with AD_, CN_, or MCI_."
+        )
+
+    return LABEL_MAP[label_name]
+
+
+def list_images(folder):
+    folder = Path(folder)
+
+    if not folder.exists():
+        raise FileNotFoundError(f"Folder not found: {folder}")
+
+    return sorted([
+        p for p in folder.iterdir()
+        if p.is_file() and p.suffix.lower() in IMG_EXTENSIONS
+    ])
+
+
+def load_and_split_folder(folder, seed=42):
+    """
+    Leakage-safe duplicate-aware split for one folder.
+
+    This helper is retained for compatibility and diagnostics. The main
+    experiment uses load_combined_duplicate_safe_split(), which performs
+    ONE global split across both axial and coronal folders.
+
+    Images that are byte-identical are treated as one group and all members
+    of a group are assigned to the same partition.
+    """
+    return _duplicate_aware_split_paths(list_images(Path(folder)), seed=seed)
+
+
+def _duplicate_aware_split_paths(image_paths, seed=42):
+    """Split a list of image paths into approximately 80/10/10 partitions.
+
+    Exact byte-identical files are grouped before allocation. Allocation is
+    performed within each class so the split remains approximately stratified.
+    """
+    image_paths = list(image_paths)
+    if not image_paths:
+        raise RuntimeError("No images were found for splitting.")
+
+    labels = np.asarray(
+        [extract_label(Path(p).name) for p in image_paths],
+        dtype=np.int64,
+    )
+
+    # Group exact byte-identical files.
+    hash_groups = {}
+    for idx, path in enumerate(image_paths):
+        digest = _file_sha256(path)
+        hash_groups.setdefault(digest, []).append(idx)
+
+    groups = []
+    for digest, idxs in hash_groups.items():
+        group_labels = labels[idxs]
+        if len(set(group_labels.tolist())) > 1:
+            bad_paths = [str(image_paths[i]) for i in idxs]
+            raise RuntimeError(
+                "A byte-identical image occurs with different labels:\n"
+                + "\n".join(bad_paths)
+            )
+        groups.append({
+            "sha256": digest,
+            "indices": idxs,
+            "label": int(group_labels[0]),
+            "size": len(idxs),
+        })
+
+    rng = np.random.RandomState(seed)
+    split_indices = {"train": [], "val": [], "test": []}
+
+    for class_id in range(len(CLASS_NAMES)):
+        class_groups = [g for g in groups if g["label"] == class_id]
+        rng.shuffle(class_groups)
+
+        total = sum(g["size"] for g in class_groups)
+        target_train = int(round(0.80 * total))
+        target_val = int(round(0.10 * total))
+
+        train_count = 0
+        val_count = 0
+
+        for group in class_groups:
+            if train_count < target_train:
+                destination = "train"
+                train_count += group["size"]
+            elif val_count < target_val:
+                destination = "val"
+                val_count += group["size"]
+            else:
+                destination = "test"
+            split_indices[destination].extend(group["indices"])
+
+    for split_name in split_indices:
+        rng.shuffle(split_indices[split_name])
+
+    image_paths = np.asarray([str(p) for p in image_paths], dtype=object)
+
+    return {
+        "train_paths": image_paths[split_indices["train"]].tolist(),
+        "train_labels": labels[split_indices["train"]].tolist(),
+        "val_paths": image_paths[split_indices["val"]].tolist(),
+        "val_labels": labels[split_indices["val"]].tolist(),
+        "test_paths": image_paths[split_indices["test"]].tolist(),
+        "test_labels": labels[split_indices["test"]].tolist(),
+    }
+
+
+def load_combined_duplicate_safe_split(axial_folder, coronal_folder, seed=42):
+    """Construct ONE global leakage-safe split over axial + coronal images.
+
+    Axial and coronal images remain independent samples; they are not paired.
+    The global duplicate grouping is important because an identical image can
+    otherwise occur once in the axial directory and once in the coronal
+    directory and be assigned to different partitions.
+    """
+    axial_paths = list_images(Path(axial_folder))
+    coronal_paths = list_images(Path(coronal_folder))
+    all_paths = axial_paths + coronal_paths
+
+    if not all_paths:
+        raise RuntimeError("No axial/coronal MRI images were found.")
+
+    return _duplicate_aware_split_paths(all_paths, seed=seed)
+
+
+def count_modalities_in_split(split):
+    """Return axial/coronal counts for each partition for reporting."""
+    counts = {}
+    for split_name in ("train", "val", "test"):
+        paths = split[f"{split_name}_paths"]
+        axial = sum("ax_AD_CN_MCI" in str(Path(p).parent) for p in paths)
+        coronal = sum("cr_AD_CN_MCI" in str(Path(p).parent) for p in paths)
+        counts[split_name] = {
+            "axial": int(axial),
+            "coronal": int(coronal),
+            "combined": int(len(paths)),
+        }
+    return counts
+
+
+def verify_duplicate_groups_are_partition_safe(split):
+    """Return duplicate groups and assert that no group crosses partitions."""
+    hashes = {}
+    for split_name in ("train", "val", "test"):
+        for path in split[f"{split_name}_paths"]:
+            digest = _file_sha256(path)
+            hashes.setdefault(digest, []).append((split_name, path))
+
+    cross_split = []
+    for digest, items in hashes.items():
+        split_names = sorted({s for s, _ in items})
+        if len(split_names) > 1:
+            cross_split.append({"sha256": digest, "items": items})
+
+    if cross_split:
+        raise RuntimeError(
+            f"Duplicate-aware split failed: {len(cross_split)} "
+            "byte-identical group(s) cross train/val/test."
+        )
+
+    return cross_split
+
+
+class MRIDataset(Dataset):
+    """Single-image dataset matching the original split protocol."""
+
+    def __init__(self, paths, labels, train=False):
+        self.paths = list(paths)
+        self.labels = list(labels)
+        self.transform = TRAIN_TRANSFORM if train else EVAL_TRANSFORM
+
+    def __len__(self):
+        return len(self.paths)
+
+    def __getitem__(self, idx):
+        image = Image.open(self.paths[idx]).convert("RGB")
+        image = self.transform(image)
+
+        return {
+            "image": image,
+            "label": torch.tensor(
+                int(self.labels[idx]),
+                dtype=torch.long,
+            ),
+            "filename": Path(self.paths[idx]).name,
+            "path": self.paths[idx],
+        }
+
+
+# ================================================================
+# 4. SEMANTIC CONCEPT BANK
+# ================================================================
+
+REGION_NAMES = ["hippocampus", "ventricle", "cortex"]
+
+REGION_CONCEPTS = {
+    "hippocampus": [
+        "hippocampal atrophy",
+        "hippocampal preservation",
+    ],
+    "ventricle": [
+        "ventricular enlargement",
+        "ventricular preservation",
+    ],
+    "cortex": [
+        "cortical atrophy",
+        "cortical preservation",
+    ],
+}
+
+DISEASE_CONCEPTS = [
+    "Alzheimer disease with neurodegenerative brain atrophy",
+    "cognitively normal brain with preserved structure",
+    "mild cognitive impairment with mild structural brain changes",
+]
+
+
+class ScratchTextEncoder(nn.Module):
+    """
+    Small Transformer text encoder trained entirely from scratch.
+
+    It is used only to encode the fixed semantic concept phrases.
+    Token embeddings, positional embeddings, Transformer layers, and
+    normalization parameters are all randomly initialized.
+    """
+
+    def __init__(
+        self,
+        vocab_size,
+        text_dim=TEXT_DIM,
+        max_len=32,
+        num_layers=4,
+        num_heads=6,
+        mlp_dim=None,
+        dropout=0.10,
+    ):
+        super().__init__()
+
+        if text_dim % num_heads != 0:
+            raise ValueError(
+                f"text_dim={text_dim} must be divisible by "
+                f"num_heads={num_heads}."
+            )
+
+        mlp_dim = mlp_dim or text_dim * 4
+
+        self.token_embedding = nn.Embedding(vocab_size, text_dim)
+        self.position_embedding = nn.Parameter(
+            torch.randn(1, max_len, text_dim) * 0.02
+        )
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=text_dim,
+            nhead=num_heads,
+            dim_feedforward=mlp_dim,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+
+        self.encoder = nn.TransformerEncoder(
+            encoder_layer,
+            num_layers=num_layers,
+        )
+
+        self.norm = nn.LayerNorm(text_dim)
+        self.max_len = max_len
+
+        self._reset_parameters()
+
+    def _reset_parameters(self):
+        nn.init.normal_(self.token_embedding.weight, mean=0.0, std=0.02)
+
+    def forward(self, token_ids, attention_mask):
+        if token_ids.size(1) > self.max_len:
+            raise ValueError(
+                f"Sequence length {token_ids.size(1)} exceeds "
+                f"max_len={self.max_len}."
+            )
+
+        x = self.token_embedding(token_ids)
+        x = x + self.position_embedding[:, :x.size(1)]
+
+        # TransformerEncoder expects True at padded positions.
+        padding_mask = attention_mask == 0
+        x = self.encoder(x, src_key_padding_mask=padding_mask)
+        x = self.norm(x)
+
+        mask = attention_mask.unsqueeze(-1).float()
+        x = (x * mask).sum(dim=1)
+        x = x / mask.sum(dim=1).clamp_min(1.0)
+
+        return x
+
+
+class MedicalSemanticBank(nn.Module):
+    """
+    Trainable semantic prototype bank initialized entirely from scratch.
+
+    The phrases are fixed semantic concepts, but their embeddings are
+    learned during MRI classification training. There is no pretrained
+    language model and no external language-model checkpoint.
+    """
+
+    def __init__(self):
+        super().__init__()
+
+        all_phrases = []
+        self.region_phrase_indices = {}
+
+        for region in REGION_NAMES:
+            start = len(all_phrases)
+            all_phrases.extend(REGION_CONCEPTS[region])
+            end = len(all_phrases)
+            self.region_phrase_indices[region] = list(range(start, end))
+
+        disease_start = len(all_phrases)
+        all_phrases.extend(DISEASE_CONCEPTS)
+        disease_indices = list(range(disease_start, len(all_phrases)))
+
+        self.phrases = all_phrases
+        self.vocab = self._build_vocab(all_phrases)
+
+        self.text_encoder = ScratchTextEncoder(
+            vocab_size=len(self.vocab),
+            text_dim=TEXT_DIM,
+            max_len=32,
+            num_layers=4,
+            num_heads=6,
+            mlp_dim=TEXT_DIM * 4,
+            dropout=0.10,
+        )
+
+        token_ids, attention_masks = self._encode_phrases(all_phrases)
+
+        self.register_buffer(
+            "phrase_token_ids",
+            token_ids,
+            persistent=True,
+        )
+        self.register_buffer(
+            "phrase_attention_masks",
+            attention_masks,
+            persistent=True,
+        )
+
+        self.region_phrase_indices_tensor = {
+            k: torch.tensor(v, dtype=torch.long)
+            for k, v in self.region_phrase_indices.items()
+        }
+
+        self.disease_indices = torch.tensor(
+            disease_indices,
+            dtype=torch.long,
+        )
+
+    @staticmethod
+    def _tokenize_phrase(phrase):
+        # Simple deterministic word/subword-like tokenizer.
+        # The vocabulary is learned only from the fixed concept strings.
+        return re.findall(r"[a-z]+", phrase.lower())
+
+    def _build_vocab(self, phrases):
+        vocab = {
+            "[PAD]": 0,
+            "[UNK]": 1,
+        }
+
+        for phrase in phrases:
+            for token in self._tokenize_phrase(phrase):
+                if token not in vocab:
+                    vocab[token] = len(vocab)
+
+        return vocab
+
+    def _encode_phrases(self, phrases):
+        max_len = 32
+        token_ids = []
+        attention_masks = []
+
+        for phrase in phrases:
+            tokens = self._tokenize_phrase(phrase)
+            ids = [self.vocab.get(tok, self.vocab["[UNK]"])
+                   for tok in tokens]
+
+            ids = ids[:max_len]
+            mask = [1] * len(ids)
+
+            if len(ids) < max_len:
+                pad_len = max_len - len(ids)
+                ids.extend([self.vocab["[PAD]"]] * pad_len)
+                mask.extend([0] * pad_len)
+
+            token_ids.append(ids)
+            attention_masks.append(mask)
+
+        return (
+            torch.tensor(token_ids, dtype=torch.long),
+            torch.tensor(attention_masks, dtype=torch.long),
+        )
+
+    def _all_embeddings(self):
+        embeddings = self.text_encoder(
+            self.phrase_token_ids,
+            self.phrase_attention_masks,
+        )
+        return F.normalize(embeddings, dim=-1)
+
+    def region_embeddings(self, region, device):
+        embeddings = self._all_embeddings()
+        idx = self.region_phrase_indices_tensor[region].to(device)
+        return embeddings[idx]
+
+    def disease_embeddings(self, device):
+        embeddings = self._all_embeddings()
+        return embeddings[self.disease_indices.to(device)]
+
+    def extra_repr(self):
+        return (
+            f"vocab_size={len(self.vocab)}, "
+            f"phrases={len(self.phrases)}, "
+            f"text_dim={TEXT_DIM}, "
+            f"pretrained=False"
+        )
+
+
+# ================================================================
+# 5. SEMANTICALLY ANCHORED ROI DETECTOR
+# ================================================================
+
+class SemanticROIDetector(nn.Module):
+    """
+    Three learned attention maps.
+
+    Unlike the original implementation, the ROI maps are not simply
+    averaged to one scalar. They are used to pool spatial visual
+    features. Their specialization is encouraged by region-specific
+    language concepts.
+    """
+
+    def __init__(self, in_channels=3):
+        super().__init__()
+
+        self.backbone = nn.Sequential(
+            nn.Conv2d(in_channels, 32, 3, padding=1),
+            nn.BatchNorm2d(32),
+            nn.GELU(),
+
+            nn.Conv2d(32, 64, 3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.GELU(),
+
+            nn.Conv2d(64, 32, 3, padding=1),
+            nn.BatchNorm2d(32),
+            nn.GELU(),
+        )
+
+        self.map_head = nn.Conv2d(32, 3, kernel_size=1)
+
+    def forward(self, x):
+        h = self.backbone(x)
+        # Spatial softmax gives each learned ROI a stable probability
+        # distribution over image locations.
+        maps = self.map_head(h)
+        maps = maps.flatten(2)
+        maps = torch.softmax(maps, dim=-1)
+        maps = maps.view(x.size(0), 3, x.size(2), x.size(3))
+
+        return maps[:, 0:1], maps[:, 1:2], maps[:, 2:3]
+
+
+# ================================================================
+# 6. WINDOWED TRANSFORMER BLOCK
+# ================================================================
+
+def window_partition(x, window_size):
+    """
+    x: [B, H, W, C]
+    returns [B*nW, window_size*window_size, C]
+    """
+    B, H, W, C = x.shape
+
+    pad_h = (window_size - H % window_size) % window_size
+    pad_w = (window_size - W % window_size) % window_size
+
+    if pad_h or pad_w:
+        x = x.permute(0, 3, 1, 2)
+        x = F.pad(x, (0, pad_w, 0, pad_h))
+        x = x.permute(0, 2, 3, 1)
+
+    Hp, Wp = x.shape[1], x.shape[2]
+
+    x = x.view(
+        B,
+        Hp // window_size,
+        window_size,
+        Wp // window_size,
+        window_size,
+        C,
+    )
+
+    windows = (
+        x.permute(0, 1, 3, 2, 4, 5)
+        .contiguous()
+        .view(-1, window_size * window_size, C)
+    )
+
+    return windows, Hp, Wp
+
+
+def window_reverse(windows, window_size, B, Hp, Wp, H, W):
+    C = windows.shape[-1]
+
+    x = windows.view(
+        B,
+        Hp // window_size,
+        Wp // window_size,
+        window_size,
+        window_size,
+        C,
+    )
+
+    x = (
+        x.permute(0, 1, 3, 2, 4, 5)
+        .contiguous()
+        .view(B, Hp, Wp, C)
+    )
+
+    return x[:, :H, :W]
+
+
+class MLPBlock(nn.Module):
+    def __init__(self, dim, mlp_dim, dropout=0.1):
+        super().__init__()
+
+        self.net = nn.Sequential(
+            nn.Linear(dim, mlp_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(mlp_dim, dim),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class ShiftedWindowTransformerBlock(nn.Module):
+    """
+    Swin-style alternating regular and shifted windows.
+    """
+
+    def __init__(
+        self,
+        dim,
+        num_heads,
+        window_size=7,
+        shift_size=0,
+        mlp_dim=None,
+        dropout=0.1,
+    ):
+        super().__init__()
+
+        mlp_dim = mlp_dim or dim * 4
+
+        self.window_size = window_size
+        self.shift_size = shift_size
+
+        self.norm1 = nn.LayerNorm(dim)
+        self.attn = nn.MultiheadAttention(
+            embed_dim=dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+
+        self.norm2 = nn.LayerNorm(dim)
+        self.mlp = MLPBlock(dim, mlp_dim, dropout)
+
+    def forward(self, x):
+        # x: [B,H,W,C]
+        B, H, W, C = x.shape
+
+        shortcut = x
+        x_norm = self.norm1(x)
+
+        if self.shift_size > 0:
+            shifted = torch.roll(
+                x_norm,
+                shifts=(-self.shift_size, -self.shift_size),
+                dims=(1, 2),
+            )
+        else:
+            shifted = x_norm
+
+        windows, Hp, Wp = window_partition(
+            shifted,
+            self.window_size,
+        )
+
+        attn_windows, _ = self.attn(
+            windows,
+            windows,
+            windows,
+            need_weights=False,
+        )
+
+        shifted_out = window_reverse(
+            attn_windows,
+            self.window_size,
+            B,
+            Hp,
+            Wp,
+            H,
+            W,
+        )
+
+        if self.shift_size > 0:
+            x = torch.roll(
+                shifted_out,
+                shifts=(self.shift_size, self.shift_size),
+                dims=(1, 2),
+            )
+        else:
+            x = shifted_out
+
+        x = shortcut + x
+        x = x + self.mlp(self.norm2(x))
+
+        return x
+
+
+# ================================================================
+# 7. GLOBAL VISION TRANSFORMER BLOCK
+# ================================================================
+
+class GlobalTransformerBlock(nn.Module):
+    def __init__(self, dim, num_heads, mlp_dim, dropout=0.1):
+        super().__init__()
+
+        self.norm1 = nn.LayerNorm(dim)
+        self.attn = nn.MultiheadAttention(
+            dim,
+            num_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+
+        self.norm2 = nn.LayerNorm(dim)
+        self.mlp = MLPBlock(dim, mlp_dim, dropout)
+
+    def forward(self, x):
+        y = self.norm1(x)
+        y, _ = self.attn(y, y, y, need_weights=False)
+        x = x + y
+        x = x + self.mlp(self.norm2(x))
+        return x
+
+
+# ================================================================
+# 8. VISUAL ENCODER
+# ================================================================
+
+class VisualEncoder(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+        self.roi_detector = SemanticROIDetector()
+
+        # Hierarchical convolutional stem makes scratch optimization
+        # substantially easier than projecting raw 224x224 pixels directly
+        # into a 384-D token space.
+        self.stem = nn.Sequential(
+            nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3, bias=False),
+            nn.BatchNorm2d(64),
+            nn.GELU(),
+            nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(128),
+            nn.GELU(),
+            nn.Conv2d(128, 192, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(192),
+            nn.GELU(),
+        )
+        self.scale28_proj = nn.Conv2d(192, VISION_DIM, kernel_size=1, bias=False)
+        self.scale14_down = nn.Sequential(
+            nn.Conv2d(192, VISION_DIM, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(VISION_DIM),
+            nn.GELU(),
+        )
+
+        # 224 -> 112 -> 56 -> 28 -> 14
+        self.patch_pos = nn.Parameter(
+            torch.zeros(1, 14, 14, VISION_DIM)
+        )
+        nn.init.trunc_normal_(self.patch_pos, std=0.02)
+
+        self.swin_blocks = nn.ModuleList()
+
+        for i in range(NUM_WINDOW_BLOCKS):
+            shift = 0 if i % 2 == 0 else WINDOW_SIZE // 2
+
+            self.swin_blocks.append(
+                ShiftedWindowTransformerBlock(
+                    dim=VISION_DIM,
+                    num_heads=VISION_HEADS,
+                    window_size=WINDOW_SIZE,
+                    shift_size=shift,
+                    mlp_dim=VISION_MLP_DIM,
+                    dropout=0.1,
+                )
+            )
+
+        self.cls_token = nn.Parameter(
+            torch.randn(1, 1, VISION_DIM) * 0.02
+        )
+
+        self.region_embeddings = nn.Parameter(
+            torch.randn(1, 3, VISION_DIM) * 0.02
+        )
+
+        self.global_blocks = nn.ModuleList([
+            GlobalTransformerBlock(
+                dim=VISION_DIM,
+                num_heads=VISION_HEADS,
+                mlp_dim=VISION_MLP_DIM,
+                dropout=0.1,
+            )
+            for _ in range(NUM_GLOBAL_BLOCKS)
+        ])
+
+        self.final_norm = nn.LayerNorm(VISION_DIM)
+
+    def masked_pool(self, feature_map, roi_map):
+        """
+        feature_map: [B,C,H,W]
+        roi_map:     [B,1,H0,W0]
+        """
+        roi_map = F.interpolate(
+            roi_map,
+            size=feature_map.shape[-2:],
+            mode="bilinear",
+            align_corners=False,
+        )
+
+        weights = roi_map / (
+            roi_map.sum(dim=(-2, -1), keepdim=True) + 1e-6
+        )
+
+        pooled = (feature_map * weights).sum(dim=(-2, -1))
+        return pooled
+
+    def forward(self, x, region_keep=None):
+        """
+        region_keep:
+            None or [B,3] with 1=keep and 0=counterfactually mask.
+        """
+        roi_maps = self.roi_detector(x)
+
+        stem28 = self.stem(x)
+        feat14 = self.scale14_down(stem28)
+        # Preserve medium-resolution anatomical information by pooling a
+        # 28x28 feature map into the 14x14 token grid and adding it to the
+        # high-level representation.
+        scale28 = self.scale28_proj(stem28)
+        scale28_to14 = F.adaptive_avg_pool2d(scale28, (14, 14))
+        feat = feat14 + scale28_to14
+        feat = feat.permute(0, 2, 3, 1)
+        feat = feat + self.patch_pos
+
+        for block in self.swin_blocks:
+            feat = block(feat)
+
+        feat_map = feat.permute(0, 3, 1, 2)
+
+        region_tokens = []
+
+        for idx, roi_map in enumerate(roi_maps):
+            token = self.masked_pool(feat_map, roi_map)
+            token = token.unsqueeze(1)
+            region_tokens.append(token)
+
+        region_tokens = torch.cat(region_tokens, dim=1)
+        region_tokens = region_tokens + self.region_embeddings
+
+        if region_keep is not None:
+            region_tokens = (
+                region_tokens *
+                region_keep.unsqueeze(-1)
+            )
+
+        patch_tokens = feat_map.flatten(2).transpose(1, 2)
+
+        B = x.shape[0]
+
+        cls = self.cls_token.expand(B, -1, -1)
+
+        tokens = torch.cat(
+            [cls, region_tokens, patch_tokens],
+            dim=1,
+        )
+
+        for block in self.global_blocks:
+            tokens = block(tokens)
+
+        tokens = self.final_norm(tokens)
+
+        return {
+            "tokens": tokens,
+            "global": tokens[:, 0],
+            "regions": tokens[:, 1:4],
+            "roi_maps": roi_maps,
+        }
+
+
+# ================================================================
+# 9. REGION-LANGUAGE GROUNDING
+# ================================================================
+
+class RegionLanguageGrounder(nn.Module):
+    """
+    Each learned ROI has its own two semantic concepts.
+
+    hippocampus -> atrophy / preservation
+    ventricle   -> enlargement / preservation
+    cortex      -> atrophy / preservation
+    """
+
+    def __init__(self, dim=VISION_DIM, text_dim=TEXT_DIM):
+        super().__init__()
+
+        self.region_to_text = nn.Linear(dim, text_dim)
+
+        self.text_to_visual = nn.Linear(text_dim, dim)
+
+        self.semantic_norm = nn.LayerNorm(dim)
+
+        self.gate = nn.Sequential(
+            nn.Linear(dim * 2, dim),
+            nn.GELU(),
+            nn.Linear(dim, dim),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, region_tokens, semantic_bank, labels=None):
+        B = region_tokens.shape[0]
+        device = region_tokens.device
+
+        fused_regions = []
+        alignment_losses = []
+        attribute_probs = []
+
+        for region_idx, region_name in enumerate(REGION_NAMES):
+            region = region_tokens[:, region_idx]
+
+            visual_text_space = F.normalize(
+                self.region_to_text(region),
+                dim=-1,
+            )
+
+            text_proto = semantic_bank.region_embeddings(
+                region_name,
+                device,
+            )
+
+            text_proto = F.normalize(text_proto, dim=-1)
+
+            similarity = (
+                visual_text_space @ text_proto.t()
+            ) / TEMPERATURE
+
+            probs = torch.softmax(similarity, dim=-1)
+
+            attribute_probs.append(probs)
+
+            # The first phrase is the abnormality concept.
+            # The second phrase is the preservation concept.
+            # This is a semantic contrast, not a diagnostic label input.
+            fused_text = (
+                probs[:, 0:1] * text_proto[0:1] +
+                probs[:, 1:2] * text_proto[1:2]
+            )
+
+            fused_text = self.text_to_visual(fused_text)
+
+            gate = self.gate(
+                torch.cat(
+                    [region, fused_text],
+                    dim=-1,
+                )
+            )
+
+            fused = (
+                gate * region +
+                (1.0 - gate) * fused_text
+            )
+
+            fused = self.semantic_norm(fused)
+            fused_regions.append(fused)
+
+            # Class-aware contrastive region-semantic alignment.
+            #
+            # AD and MCI are encouraged toward the abnormality concept,
+            # while CN is encouraged toward the preservation concept.
+            # The diagnostic label is used as a training target only; it
+            # is NOT supplied as an input to the model.
+            #
+            # This avoids the previous implementation's problem of forcing
+            # every image, including CN, toward the abnormality concept.
+            if labels is not None:
+                labels = labels.to(device)
+                target_index = torch.where(
+                    labels == LABEL_MAP["CN"],
+                    torch.ones_like(labels),
+                    torch.zeros_like(labels),
+                )
+                align_loss = F.cross_entropy(similarity, target_index)
+            else:
+                # Safe fallback for inference/visualization.
+                # No semantic alignment loss is applied without labels.
+                align_loss = similarity.new_tensor(0.0)
+
+            alignment_losses.append(align_loss)
+
+        fused_regions = torch.stack(fused_regions, dim=1)
+
+        return {
+            "fused_regions": fused_regions,
+            "alignment_loss": torch.stack(
+                alignment_losses
+            ).mean(),
+            "attribute_probs": torch.stack(
+                attribute_probs,
+                dim=1,
+            ),
+        }
+
+
+# ================================================================
+
+# ================================================================
+# 10. ANATOMY-GROUNDED VISION-LANGUAGE MODEL
+# ================================================================
+
+class AnatomyGroundedVLModel(nn.Module):
+    def __init__(
+        self,
+        semantic_bank,
+        use_roi=True,
+        use_language=True,
+        use_region_dropout=True,
+    ):
+        super().__init__()
+
+        self.use_roi = use_roi
+        self.use_language = use_language
+        self.use_region_dropout = use_region_dropout
+
+        self.semantic_bank = semantic_bank
+        self.visual_encoder = VisualEncoder()
+        self.region_grounder = RegionLanguageGrounder()
+
+        self.semantic_fusion = nn.Sequential(
+            nn.Linear(VISION_DIM * 2, VISION_DIM),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(VISION_DIM, VISION_DIM),
+        )
+
+        self.final_fusion = nn.Sequential(
+            nn.Linear(VISION_DIM * 3, VISION_DIM),
+            nn.GELU(),
+            nn.Dropout(0.2),
+            nn.Linear(VISION_DIM, VISION_DIM),
+        )
+
+        self.classifier = nn.Linear(VISION_DIM, len(CLASS_NAMES))
+
+        self.visual_to_text = nn.Linear(VISION_DIM, TEXT_DIM)
+
+    def disease_semantic_logits(self, visual_feature):
+        text_proto = self.semantic_bank.disease_embeddings(
+            visual_feature.device
+        )
+
+        visual = F.normalize(
+            self.visual_to_text(visual_feature),
+            dim=-1,
+        )
+
+        text_proto = F.normalize(text_proto, dim=-1)
+
+        return (visual @ text_proto.t()) / TEMPERATURE
+
+    def encode_image(self, image, region_keep=None, labels=None):
+        out = self.visual_encoder(
+            image,
+            region_keep=region_keep,
+        )
+
+        if self.use_roi and self.use_language:
+            # Full model: anatomically localized visual tokens are grounded
+            # against the region-specific semantic concept bank.
+            region_info = self.region_grounder(
+                out["regions"],
+                self.semantic_bank,
+                labels=labels,
+            )
+            region_features = region_info["fused_regions"]
+            region_align_loss = region_info["alignment_loss"]
+            attribute_probs = region_info["attribute_probs"]
+        elif self.use_roi and not self.use_language:
+            # Language ablation: retain the learned visual ROI tokens but
+            # remove all region-language grounding and its alignment loss.
+            region_features = out["regions"]
+            region_align_loss = out["global"].new_tensor(0.0)
+            attribute_probs = None
+        else:
+            # ROI ablation: no region-specific representation is supplied.
+            region_features = torch.zeros_like(out["regions"])
+            region_align_loss = out["global"].new_tensor(0.0)
+            attribute_probs = None
+
+        return {
+            **out,
+            "region_features": region_features,
+            "region_align_loss": region_align_loss,
+            "attribute_probs": attribute_probs,
+        }
+
+    def forward(self, image, region_keep=None, labels=None):
+        out = self.encode_image(
+            image,
+            region_keep=region_keep,
+            labels=labels,
+        )
+
+        if self.use_language:
+            region_summary = out["region_features"].mean(dim=1)
+
+            semantic_feature = self.semantic_fusion(
+                torch.cat(
+                    [out["global"], region_summary],
+                    dim=-1,
+                )
+            )
+
+            final_feature = self.final_fusion(
+                torch.cat(
+                    [
+                        out["global"],
+                        region_summary,
+                        semantic_feature,
+                    ],
+                    dim=-1,
+                )
+            )
+
+            semantic_logits = self.disease_semantic_logits(final_feature)
+
+            logits = (
+                self.classifier(final_feature)
+                + SEMANTIC_LOGIT_WEIGHT * semantic_logits
+            )
+        else:
+            final_feature = self.final_fusion(
+                torch.cat(
+                    [
+                        out["global"],
+                        out["global"],
+                        out["global"],
+                    ],
+                    dim=-1,
+                )
+            )
+
+            semantic_logits = torch.zeros(
+                image.shape[0],
+                len(CLASS_NAMES),
+                device=image.device,
+            )
+
+            logits = self.classifier(final_feature)
+
+        return {
+            "logits": logits,
+            "semantic_logits": semantic_logits,
+            "global_feature": out["global"],
+            "region_features": out["region_features"],
+            "region_align_loss": out["region_align_loss"],
+            "roi_maps": out["roi_maps"],
+            "attribute_probs": out["attribute_probs"],
+        }
+
+    @torch.no_grad()
+    def counterfactual_region_logits(self, image):
+        base = self.forward(image)
+        outputs = {"original": base["logits"]}
+
+        for region_idx, region_name in enumerate(REGION_NAMES):
+            keep = torch.ones(
+                image.size(0),
+                3,
+                device=image.device,
+            )
+            keep[:, region_idx] = 0.0
+
+            cf = self.forward(
+                image,
+                region_keep=keep,
+            )
+            outputs[region_name] = cf["logits"]
+
+        return outputs
+
+
+# ================================================================
+# 11. LOSS FUNCTIONS
+# ================================================================
+
+def classification_loss(logits, labels, class_weights=None):
+    # Class-balanced CE + focal term. Class weights come from training labels only.
+    ce = F.cross_entropy(logits, labels, weight=class_weights, label_smoothing=0.0)
+    logp = F.log_softmax(logits, dim=1)
+    p = logp.exp()
+    pt = p.gather(1, labels.unsqueeze(1)).squeeze(1).clamp_min(1e-8)
+    focal = (-((1.0 - pt) ** 1.5) * logp.gather(1, labels.unsqueeze(1)).squeeze(1)).mean()
+    return 0.70 * ce + 0.30 * focal
+
+
+def disease_semantic_loss(semantic_logits, labels):
+    return F.cross_entropy(semantic_logits, labels)
+
+
+def supervised_contrastive_loss(features, labels, temperature=0.10):
+    """
+    Supervised contrastive learning on the image representation.
+    This uses only training labels and helps separate AD/CN/MCI clusters.
+    """
+    features = F.normalize(features, dim=-1)
+    similarity = torch.matmul(features, features.t()) / temperature
+
+    labels = labels.contiguous().view(-1, 1)
+    positive_mask = torch.eq(labels, labels.T).float()
+
+    logits_mask = torch.ones_like(positive_mask)
+    logits_mask.fill_diagonal_(0)
+    positive_mask = positive_mask * logits_mask
+
+    logits = similarity - similarity.max(dim=1, keepdim=True).values.detach()
+    exp_logits = torch.exp(logits) * logits_mask
+    log_prob = logits - torch.log(exp_logits.sum(dim=1, keepdim=True).clamp_min(1e-8))
+
+    positive_count = positive_mask.sum(dim=1)
+    valid = positive_count > 0
+
+    if not valid.any():
+        return features.new_tensor(0.0)
+
+    mean_log_prob_pos = (
+        (positive_mask * log_prob).sum(dim=1) /
+        positive_count.clamp_min(1.0)
+    )
+
+    return -mean_log_prob_pos[valid].mean()
+
+
+def region_dropout_consistency_loss(
+    model,
+    image,
+    original_logits,
+    labels=None,
+):
+    B = image.size(0)
+
+    region_idx = torch.randint(
+        low=0,
+        high=3,
+        size=(B,),
+        device=image.device,
+    )
+
+    keep = torch.ones(
+        B,
+        3,
+        device=image.device,
+    )
+
+    keep[
+        torch.arange(B, device=image.device),
+        region_idx,
+    ] = 0.0
+
+    cf = model(
+        image,
+        region_keep=keep,
+        labels=labels,
+    )
+
+    p = F.softmax(original_logits.detach(), dim=-1)
+    log_q = F.log_softmax(cf["logits"], dim=-1)
+
+    return F.kl_div(log_q, p, reduction="batchmean")
+
+
+# ================================================================
+# 12. AMP CONTEXT
+# ================================================================
+
+def autocast_context():
+    if AMP_ENABLED:
+        return torch.autocast(
+            device_type="cuda",
+            dtype=torch.float16,
+        )
+    return nullcontext()
+
+
+# ================================================================
+# 13. TRAINING
+# ================================================================
+
+def train_one_epoch(
+    model,
+    loader,
+    optimizer,
+    scaler,
+    class_weights,
+    epoch,
+):
+    model.train()
+
+    total_loss = 0.0
+    total_cls = 0.0
+    total_region = 0.0
+    total_semantic = 0.0
+    total_cf = 0.0
+    total_supcon = 0.0
+
+    all_preds = []
+    all_labels = []
+
+    # Gradually introduce auxiliary objectives after the classifier has
+    # learned a basic visual representation.
+    ramp = min(1.0, epoch / max(1, WARMUP_EPOCHS))
+
+    optimizer.zero_grad(set_to_none=True)
+
+    for step, batch in enumerate(
+        tqdm(loader, desc=f"Training epoch {epoch}", leave=False)
+    ):
+        image = batch["image"].to(DEVICE, non_blocking=True)
+        labels = batch["label"].to(DEVICE, non_blocking=True)
+
+        with autocast_context():
+            out = model(image, labels=labels)
+
+            cls_loss = classification_loss(
+                out["logits"],
+                labels,
+                class_weights=class_weights,
+            )
+
+            region_loss = out["region_align_loss"]
+
+            if model.use_language:
+                semantic_loss = disease_semantic_loss(
+                    out["semantic_logits"],
+                    labels,
+                )
+            else:
+                semantic_loss = out["logits"].new_tensor(0.0)
+
+            if model.use_region_dropout and ramp > 0:
+                cf_loss = region_dropout_consistency_loss(
+                    model,
+                    image,
+                    out["logits"],
+                    labels=labels,
+                )
+            else:
+                cf_loss = out["logits"].new_tensor(0.0)
+
+            supcon_loss = supervised_contrastive_loss(
+                out["global_feature"],
+                labels,
+                temperature=TEMPERATURE,
+            )
+
+            loss = (
+                cls_loss
+                + ramp * LAMBDA_REGION_ALIGN * region_loss
+                + ramp * LAMBDA_DISEASE_ALIGN * semantic_loss
+                + ramp * LAMBDA_REGION_DROPOUT * cf_loss
+                + ramp * LAMBDA_SUPCON * supcon_loss
+            )
+
+            loss_for_backward = loss / GRAD_ACCUM_STEPS
+
+        scaler.scale(loss_for_backward).backward()
+
+        if (
+            (step + 1) % GRAD_ACCUM_STEPS == 0
+            or (step + 1) == len(loader)
+        ):
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(
+                model.parameters(),
+                max_norm=1.0,
+            )
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad(set_to_none=True)
+
+        total_loss += loss.item()
+        total_cls += cls_loss.item()
+        total_region += region_loss.item()
+        total_semantic += semantic_loss.item()
+        total_cf += cf_loss.item()
+        total_supcon += supcon_loss.item()
+
+        preds = out["logits"].argmax(dim=1)
+        all_preds.extend(preds.detach().cpu().numpy())
+        all_labels.extend(labels.detach().cpu().numpy())
+
+    accuracy = accuracy_score(all_labels, all_preds) * 100.0
+
+    return {
+        "loss": total_loss / len(loader),
+        "cls_loss": total_cls / len(loader),
+        "region_loss": total_region / len(loader),
+        "semantic_loss": total_semantic / len(loader),
+        "cf_loss": total_cf / len(loader),
+        "supcon_loss": total_supcon / len(loader),
+        "accuracy": accuracy,
+    }
+
+
+@torch.no_grad()
+def evaluate_with_tta(model, loader, split_name="Test"):
+    """
+    Deterministic TTA: original + small translations/scale perturbations.
+    The TTA policy is fixed before evaluation and does not use test labels.
+    """
+    if not USE_TTA:
+        return evaluate(model, loader, split_name)
+
+    model.eval()
+
+    all_logits = []
+    all_probs = []
+    all_preds = []
+    all_labels = []
+    all_filenames = []
+    all_paths = []
+
+    # The dataset already provides the deterministic base evaluation tensor.
+    # TTA is performed in tensor space to avoid changing the split.
+    for batch in tqdm(loader, desc=f"Evaluating {split_name} with TTA", leave=False):
+        image = batch["image"].to(DEVICE, non_blocking=True)
+        labels = batch["label"].to(DEVICE, non_blocking=True)
+
+        variants = [
+            image,
+            torch.roll(image, shifts=(2, 0), dims=(2, 3)),
+            torch.roll(image, shifts=(-2, 0), dims=(2, 3)),
+            torch.roll(image, shifts=(0, 2), dims=(2, 3)),
+            torch.roll(image, shifts=(0, -2), dims=(2, 3)),
+        ]
+
+        logits_list = []
+        for variant in variants:
+            logits_list.append(model(variant)["logits"])
+
+        logits = torch.stack(logits_list, dim=0).mean(dim=0)
+        probs = F.softmax(logits, dim=1)
+        preds = probs.argmax(dim=1)
+
+        all_logits.append(logits.detach().cpu().numpy())
+        all_probs.append(probs.detach().cpu().numpy())
+        all_preds.extend(preds.detach().cpu().numpy())
+        all_labels.extend(labels.detach().cpu().numpy())
+        all_filenames.extend(list(batch["filename"]))
+        all_paths.extend(list(batch["path"]))
+
+    logits = np.concatenate(all_logits, axis=0)
+    probs = np.concatenate(all_probs, axis=0)
+    y_true = np.asarray(all_labels)
+    y_pred = np.asarray(all_preds)
+
+    cm = confusion_matrix(
+        y_true,
+        y_pred,
+        labels=np.arange(len(CLASS_NAMES)),
+    )
+
+    precision, recall, f1, support = precision_recall_fscore_support(
+        y_true,
+        y_pred,
+        labels=np.arange(len(CLASS_NAMES)),
+        zero_division=0,
+    )
+
+    specificity = []
+    for i in range(len(CLASS_NAMES)):
+        tp = cm[i, i]
+        fn = cm[i, :].sum() - tp
+        fp = cm[:, i].sum() - tp
+        tn = cm.sum() - tp - fn - fp
+        specificity.append(
+            tn / (tn + fp) if (tn + fp) > 0 else 0.0
+        )
+
+    specificity = np.asarray(specificity)
+
+    metrics = {
+        "accuracy": accuracy_score(y_true, y_pred),
+        "balanced_accuracy": balanced_accuracy_score(y_true, y_pred),
+        "macro_precision": precision.mean(),
+        "macro_recall": recall.mean(),
+        "macro_f1": f1.mean(),
+        "macro_specificity": specificity.mean(),
+        "cohen_kappa": cohen_kappa_score(y_true, y_pred),
+        "mcc": matthews_corrcoef(y_true, y_pred),
+    }
+
+    try:
+        metrics["macro_auc_ovr"] = roc_auc_score(
+            y_true, probs, multi_class="ovr", average="macro"
+        )
+    except ValueError:
+        metrics["macro_auc_ovr"] = float("nan")
+
+    print(f"\n===== {split_name} (TTA) =====")
+    print(f"Accuracy:           {metrics['accuracy']*100:.2f}%")
+    print(f"Balanced Accuracy:  {metrics['balanced_accuracy']*100:.2f}%")
+    print(f"Macro Precision:    {metrics['macro_precision']:.4f}")
+    print(f"Macro Recall:       {metrics['macro_recall']:.4f}")
+    print(f"Macro F1:           {metrics['macro_f1']:.4f}")
+    print(f"Macro Specificity:  {metrics['macro_specificity']:.4f}")
+    print(f"Macro AUC-OVR:      {metrics['macro_auc_ovr']:.4f}")
+    print(f"Cohen Kappa:        {metrics['cohen_kappa']:.4f}")
+    print(f"MCC:                {metrics['mcc']:.4f}")
+
+    print("\nConfusion matrix:")
+    print(pd.DataFrame(cm, index=CLASS_NAMES, columns=CLASS_NAMES))
+
+    return {
+        "metrics": metrics,
+        "confusion_matrix": cm,
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
+        "specificity": specificity,
+        "y_true": y_true,
+        "y_pred": y_pred,
+        "probs": probs,
+        "filenames": all_filenames,
+        "paths": all_paths,
+    }
+
+
+# ================================================================
+# 14. EVALUATION
+# ================================================================
+
+@torch.no_grad()
+def evaluate(model, loader, split_name="Validation"):
+    model.eval()
+
+    all_logits = []
+    all_probs = []
+    all_preds = []
+    all_labels = []
+    all_filenames = []
+    all_paths = []
+
+    for batch in tqdm(
+        loader,
+        desc=f"Evaluating {split_name}",
+        leave=False,
+    ):
+        image = batch["image"].to(DEVICE, non_blocking=True)
+        labels = batch["label"].to(DEVICE, non_blocking=True)
+
+        out = model(image)
+
+        probs = F.softmax(out["logits"], dim=1)
+        preds = probs.argmax(dim=1)
+
+        all_logits.append(out["logits"].cpu().numpy())
+        all_probs.append(probs.cpu().numpy())
+        all_preds.extend(preds.cpu().numpy())
+        all_labels.extend(labels.cpu().numpy())
+        all_filenames.extend(list(batch["filename"]))
+        all_paths.extend(list(batch["path"]))
+
+    logits = np.concatenate(all_logits, axis=0)
+    probs = np.concatenate(all_probs, axis=0)
+    y_true = np.asarray(all_labels)
+    y_pred = np.asarray(all_preds)
+
+    cm = confusion_matrix(
+        y_true,
+        y_pred,
+        labels=np.arange(len(CLASS_NAMES)),
+    )
+
+    precision, recall, f1, support = precision_recall_fscore_support(
+        y_true,
+        y_pred,
+        labels=np.arange(len(CLASS_NAMES)),
+        zero_division=0,
+    )
+
+    specificity = []
+
+    for i in range(len(CLASS_NAMES)):
+        tp = cm[i, i]
+        fn = cm[i, :].sum() - tp
+        fp = cm[:, i].sum() - tp
+        tn = cm.sum() - tp - fn - fp
+
+        specificity.append(
+            tn / (tn + fp)
+            if (tn + fp) > 0
+            else 0.0
+        )
+
+    specificity = np.asarray(specificity)
+
+    metrics = {
+        "accuracy": accuracy_score(y_true, y_pred),
+        "balanced_accuracy": balanced_accuracy_score(y_true, y_pred),
+        "macro_precision": precision.mean(),
+        "macro_recall": recall.mean(),
+        "macro_f1": f1.mean(),
+        "macro_specificity": specificity.mean(),
+        "cohen_kappa": cohen_kappa_score(y_true, y_pred),
+        "mcc": matthews_corrcoef(y_true, y_pred),
+    }
+
+    try:
+        metrics["macro_auc_ovr"] = roc_auc_score(
+            y_true,
+            probs,
+            multi_class="ovr",
+            average="macro",
+        )
+    except ValueError:
+        metrics["macro_auc_ovr"] = float("nan")
+
+    print(f"\n===== {split_name} =====")
+    print(f"Accuracy:           {metrics['accuracy']*100:.2f}%")
+    print(f"Balanced Accuracy:  {metrics['balanced_accuracy']*100:.2f}%")
+    print(f"Macro Precision:    {metrics['macro_precision']:.4f}")
+    print(f"Macro Recall:       {metrics['macro_recall']:.4f}")
+    print(f"Macro F1:           {metrics['macro_f1']:.4f}")
+    print(f"Macro Specificity:  {metrics['macro_specificity']:.4f}")
+    print(f"Macro AUC-OVR:      {metrics['macro_auc_ovr']:.4f}")
+    print(f"Cohen Kappa:        {metrics['cohen_kappa']:.4f}")
+    print(f"MCC:                {metrics['mcc']:.4f}")
+
+    print("\nPer-class metrics:")
+    for i, name in enumerate(CLASS_NAMES):
+        print(
+            f"{name:>4s}: "
+            f"Precision={precision[i]:.4f}, "
+            f"Recall={recall[i]:.4f}, "
+            f"F1={f1[i]:.4f}, "
+            f"Specificity={specificity[i]:.4f}, "
+            f"N={support[i]}"
+        )
+
+    print("\nConfusion matrix:")
+    print(pd.DataFrame(cm, index=CLASS_NAMES, columns=CLASS_NAMES))
+
+    return {
+        "metrics": metrics,
+        "confusion_matrix": cm,
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
+        "specificity": specificity,
+        "y_true": y_true,
+        "y_pred": y_pred,
+        "probs": probs,
+        "filenames": all_filenames,
+        "paths": all_paths,
+    }
+
+
+# ================================================================
+# 15. COUNTERFACTUAL ANATOMICAL EVIDENCE
+# ================================================================
+
+@torch.no_grad()
+def evaluate_counterfactual_evidence(model, loader, output_csv):
+    model.eval()
+    rows = []
+
+    for batch in tqdm(loader, desc="Counterfactual analysis"):
+        image = batch["image"].to(DEVICE)
+        labels = batch["label"].to(DEVICE)
+
+        outputs = model.counterfactual_region_logits(image)
+        original = outputs["original"]
+
+        true_idx = labels.view(-1, 1)
+        original_true = original.gather(
+            1,
+            true_idx,
+        ).squeeze(1)
+
+        for region in REGION_NAMES:
+            cf = outputs[region]
+            cf_true = cf.gather(
+                1,
+                true_idx,
+            ).squeeze(1)
+
+            evidence = original_true - cf_true
+
+            for i in range(len(evidence)):
+                rows.append({
+                    "filename": batch["filename"][i],
+                    "path": batch["path"][i],
+                    "true_class": CLASS_NAMES[labels[i].item()],
+                    "region": region,
+                    "counterfactual_evidence": float(
+                        evidence[i].cpu()
+                    ),
+                })
+
+    df = pd.DataFrame(rows)
+    df.to_csv(output_csv, index=False)
+
+    summary = (
+        df.groupby("region")["counterfactual_evidence"]
+        .agg(["mean", "std", "median"])
+        .reset_index()
+    )
+
+    print("\nCounterfactual anatomical evidence:")
+    print(summary)
+
+    return df, summary
+
+
+# ================================================================
+# 16. ROI VISUALIZATION
+# ================================================================
+
+@torch.no_grad()
+def save_roi_visualizations(model, dataset, output_dir, n_examples=12):
+    import matplotlib.pyplot as plt
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    model.eval()
+    n_examples = min(n_examples, len(dataset))
+
+    for idx in range(n_examples):
+        sample = dataset[idx]
+
+        image_tensor = sample["image"].unsqueeze(0).to(DEVICE)
+        out = model(image_tensor)
+
+        maps = out["roi_maps"]
+
+        image = sample["image"].permute(1, 2, 0).numpy()
+
+        mean = np.array([0.485, 0.456, 0.406])
+        std = np.array([0.229, 0.224, 0.225])
+
+        image = np.clip(image * std + mean, 0, 1)
+
+        fig, axes = plt.subplots(
+            1,
+            4,
+            figsize=(12, 3),
+        )
+
+        axes[0].imshow(image)
+        axes[0].set_title("MRI")
+        axes[0].axis("off")
+
+        for r, name in enumerate(REGION_NAMES):
+            # roi_detector returns a tuple of three tensors:
+            # (hippocampus_map, ventricle_map, cortex_map),
+            # each with shape [B, 1, H, W].
+            # Therefore maps[0, r] is invalid because maps is a tuple.
+            if isinstance(maps, (tuple, list)):
+                roi = maps[r][0, 0].detach().cpu().numpy()
+            else:
+                # Also support a stacked tensor with shape [B, 3, H, W].
+                roi = maps[0, r].detach().cpu().numpy()
+
+            axes[r + 1].imshow(image)
+            axes[r + 1].imshow(roi, alpha=0.45)
+            axes[r + 1].set_title(name)
+            axes[r + 1].axis("off")
+
+        plt.tight_layout()
+
+        safe_name = Path(sample["filename"]).stem
+
+        plt.savefig(
+            output_dir / f"{idx:03d}_{safe_name}.png",
+            dpi=200,
+            bbox_inches="tight",
+        )
+
+        plt.close(fig)
+
+
+# ================================================================
+# 17. MODEL COMPLEXITY
+# ================================================================
+
+def count_parameters(model):
+    """
+    Count parameter tensors only. In PyTorch, a parameter is
+    non-trainable here only when requires_grad=False.
+
+    IMPORTANT:
+    BatchNorm running_mean/running_var and other state buffers are
+    NOT parameters. They are reported separately by count_model_state.
+    """
+    total = sum(p.numel() for p in model.parameters())
+    trainable = sum(
+        p.numel()
+        for p in model.parameters()
+        if p.requires_grad
+    )
+    frozen = total - trainable
+    return total, trainable, frozen
+
+
+def count_model_state(model):
+    """Report parameter counts plus non-parameter buffers."""
+    total_params, trainable_params, frozen_params = count_parameters(model)
+    buffer_count = sum(b.numel() for b in model.buffers())
+    return {
+        "total_parameters": total_params,
+        "trainable_parameters": trainable_params,
+        "frozen_parameters": frozen_params,
+        "non_parameter_buffers": buffer_count,
+        "trainable_percent": (
+            100.0 * trainable_params / total_params
+            if total_params else 0.0
+        ),
+        "frozen_percent": (
+            100.0 * frozen_params / total_params
+            if total_params else 0.0
+        ),
+    }
+
+
+def _file_sha256(path, chunk_size=1024 * 1024):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(chunk_size)
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def audit_split_overlap(splits):
+    """
+    Verify that no exact file path occurs in more than one split and
+    report exact byte-identical image duplicates across splits.
+
+    This is an audit only; it does not change the requested split protocol.
+    """
+    split_sets = {
+        split: set(splits[f"{split}_paths"])
+        for split in ("train", "val", "test")
+    }
+
+    path_overlaps = {
+        "train_val": sorted(split_sets["train"] & split_sets["val"]),
+        "train_test": sorted(split_sets["train"] & split_sets["test"]),
+        "val_test": sorted(split_sets["val"] & split_sets["test"]),
+    }
+
+    all_paths = []
+    for split in ("train", "val", "test"):
+        all_paths.extend(
+            (split, p) for p in splits[f"{split}_paths"]
+        )
+
+    hashes = {}
+    for split, path in all_paths:
+        digest = _file_sha256(path)
+        hashes.setdefault(digest, []).append((split, path))
+
+    duplicate_groups = []
+    for digest, items in hashes.items():
+        split_names = sorted(set(s for s, _ in items))
+        if len(split_names) > 1:
+            duplicate_groups.append({
+                "sha256": digest,
+                "items": items,
+            })
+
+    print("\n===== SPLIT LEAKAGE AUDIT =====")
+    print(
+        f"Exact path overlaps: "
+        f"train-val={len(path_overlaps['train_val'])}, "
+        f"train-test={len(path_overlaps['train_test'])}, "
+        f"val-test={len(path_overlaps['val_test'])}"
+    )
+    print(
+        f"Byte-identical files crossing splits: "
+        f"{len(duplicate_groups)} duplicate group(s)"
+    )
+
+    if any(path_overlaps.values()):
+        raise RuntimeError(
+            "The same file path appears in multiple splits. "
+            "The split construction is invalid."
+        )
+
+    duplicate_rows = [
+        {
+            "sha256": d["sha256"],
+            "split": split,
+            "path": path,
+        }
+        for d in duplicate_groups
+        for split, path in d["items"]
+    ]
+    pd.DataFrame(
+        duplicate_rows,
+        columns=["sha256", "split", "path"],
+    ).to_csv(
+        OUTPUT_DIR / "cross_split_duplicate_audit.csv",
+        index=False,
+    )
+
+    if duplicate_groups:
+        print(
+            "WARNING: exact byte-identical images occur across splits. "
+            "This can cause data leakage even when paths differ."
+        )
+    else:
+        print("No exact byte-identical image files cross the splits.")
+
+    return path_overlaps, duplicate_groups
+
+
+# ================================================================
+# 18. TRAINING HISTORY
+# ================================================================
+
+def save_history(history, path):
+    pd.DataFrame(history).to_csv(path, index=False)
+
+
+# ================================================================
+# 19. TRAIN ONE COMPLETE EXPERIMENT
+# ================================================================
+
+def run_experiment(
+    seed=42,
+    experiment_name="full_model",
+    use_roi=True,
+    use_language=True,
+    use_region_dropout=True,
+    splits=None,
+):
+    print("\n" + "=" * 80)
+    print(f"EXPERIMENT: {experiment_name}")
+    print(f"SEED: {seed}")
+    print("=" * 80)
+
+    seed_everything(seed)
+
+    # ------------------------------------------------------------
+    # FIXED GLOBAL DATA-SPLITTING PROTOCOL
+    # ------------------------------------------------------------
+    # CRITICAL CORRECTION:
+    # The split is created ONCE (seed 42) and then reused for every
+    # training seed. A different split for each ensemble member would
+    # allow a model trained under seed 123/2026 to see images that belong
+    # to the seed-42 test set, causing test-set leakage.
+    if splits is None:
+        raise ValueError(
+            "A fixed train/validation/test split must be supplied to "
+            "run_experiment(). Create it once before the seed loop."
+        )
+
+    # A single global split is used for all experiments and all training seeds.
+    # Axial and coronal images remain independent samples and are not paired.
+
+    # Class weights are computed ONLY from the training labels.
+    # Validation and test labels are never used to construct weights.
+    train_label_array = np.asarray(splits["train_labels"], dtype=np.int64)
+    train_counts = np.bincount(
+        train_label_array,
+        minlength=len(CLASS_NAMES),
+    ).astype(np.float32)
+    class_weights_np = (
+        train_counts.sum() /
+        (len(CLASS_NAMES) * np.maximum(train_counts, 1.0))
+    )
+    class_weights = torch.tensor(
+        class_weights_np,
+        dtype=torch.float32,
+        device=DEVICE,
+    )
+
+    print(f"Training class counts: {train_counts.astype(int).tolist()}")
+    print(f"Training class weights: {class_weights_np.tolist()}")
+
+    print(
+        f"Combined: train={len(splits['train_paths'])}, "
+        f"val={len(splits['val_paths'])}, "
+        f"test={len(splits['test_paths'])}"
+    )
+
+    manifest_rows = []
+
+    for split_name in ("train", "val", "test"):
+        for path, label in zip(
+            splits[f"{split_name}_paths"],
+            splits[f"{split_name}_labels"],
+        ):
+            manifest_rows.append({
+                "split": split_name,
+                "filename": Path(path).name,
+                "path": path,
+                "label": int(label),
+                "class": CLASS_NAMES[int(label)],
+            })
+
+    pd.DataFrame(manifest_rows).to_csv(
+        OUTPUT_DIR / f"split_manifest_seed{seed}.csv",
+        index=False,
+    )
+
+    # ------------------------------------------------------------
+    # Dataset and loaders
+    # ------------------------------------------------------------
+    train_dataset = MRIDataset(
+        splits["train_paths"],
+        splits["train_labels"],
+        train=True,
+    )
+
+    val_dataset = MRIDataset(
+        splits["val_paths"],
+        splits["val_labels"],
+        train=False,
+    )
+
+    test_dataset = MRIDataset(
+        splits["test_paths"],
+        splits["test_labels"],
+        train=False,
+    )
+
+    train_labels_np = np.asarray(splits["train_labels"], dtype=np.int64)
+    sampler_counts = np.bincount(train_labels_np, minlength=len(CLASS_NAMES)).astype(np.float32)
+    sampler_class_weights = 1.0 / np.maximum(sampler_counts, 1.0)
+    sampler_weights = sampler_class_weights[train_labels_np]
+    train_sampler = WeightedRandomSampler(
+        weights=torch.as_tensor(sampler_weights, dtype=torch.double),
+        num_samples=len(train_dataset),
+        replacement=True,
+    )
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=BATCH_SIZE,
+        sampler=train_sampler,
+        shuffle=False,
+        num_workers=NUM_WORKERS,
+        pin_memory=(DEVICE.type == "cuda"),
+        persistent_workers=(NUM_WORKERS > 0),
+    )
+
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=False,
+        num_workers=NUM_WORKERS,
+        pin_memory=(DEVICE.type == "cuda"),
+        persistent_workers=(NUM_WORKERS > 0),
+    )
+
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=False,
+        num_workers=NUM_WORKERS,
+        pin_memory=(DEVICE.type == "cuda"),
+        persistent_workers=(NUM_WORKERS > 0),
+    )
+
+    semantic_bank = MedicalSemanticBank().to(DEVICE)
+
+    model = AnatomyGroundedVLModel(
+        semantic_bank=semantic_bank,
+        use_roi=use_roi,
+        use_language=use_language,
+        use_region_dropout=use_region_dropout,
+    ).to(DEVICE)
+
+    param_report = count_model_state(model)
+    total_params = param_report["total_parameters"]
+    trainable_params = param_report["trainable_parameters"]
+    frozen_params = param_report["frozen_parameters"]
+
+    # Scratch-training requirement: all parameters are intentionally trainable.
+    # Therefore frozen_parameters=0 is EXPECTED for this implementation.
+    if frozen_params != 0:
+        frozen_names = [
+            name for name, param in model.named_parameters()
+            if not param.requires_grad
+        ]
+        raise RuntimeError(
+            "Scratch-training requirement violated. "
+            f"{frozen_params} parameter values are frozen. "
+            f"Examples: {frozen_names[:10]}"
+        )
+
+    print("\nTRAINING MODE: ENTIRE MODEL FROM SCRATCH")
+    print("Pretrained visual weights: NO")
+    print("Pretrained language weights: NO")
+    print(f"Total parameters:          {total_params/1e6:.6f} M")
+    print(f"Trainable parameters:      {trainable_params/1e6:.6f} M")
+    print(f"Frozen parameters:          {frozen_params/1e6:.6f} M")
+    print(f"Non-parameter buffers:      {param_report['non_parameter_buffers']/1e6:.6f} M")
+    print(f"Trainable parameter ratio:  {param_report['trainable_percent']:.2f}%")
+    print(f"Frozen parameter ratio:     {param_report['frozen_percent']:.2f}%")
+
+    text_params = list(model.semantic_bank.text_encoder.parameters())
+    text_param_ids = {id(p) for p in text_params}
+
+    vision_params = [
+        p for p in model.parameters()
+        if p.requires_grad and id(p) not in text_param_ids
+    ]
+
+    optimizer = torch.optim.AdamW(
+        [
+            {
+                "params": vision_params,
+                "lr": LEARNING_RATE,
+            },
+            {
+                "params": text_params,
+                "lr": TEXT_LEARNING_RATE,
+            },
+        ],
+        weight_decay=WEIGHT_DECAY,
+        betas=(0.9, 0.999),
+    )
+
+    # Warm-up is implemented explicitly, followed by cosine decay.
+    def set_epoch_lr(epoch_idx):
+        if epoch_idx <= WARMUP_EPOCHS:
+            scale = epoch_idx / max(1, WARMUP_EPOCHS)
+        else:
+            progress = (
+                (epoch_idx - WARMUP_EPOCHS) /
+                max(1, NUM_EPOCHS - WARMUP_EPOCHS)
+            )
+            scale = 0.5 * (1.0 + math.cos(math.pi * progress))
+
+        scale = max(scale, MIN_LR / LEARNING_RATE)
+
+        optimizer.param_groups[0]["lr"] = LEARNING_RATE * scale
+        optimizer.param_groups[1]["lr"] = TEXT_LEARNING_RATE * scale
+
+    scaler = torch.amp.GradScaler(
+        "cuda",
+        enabled=AMP_ENABLED,
+    )
+
+    history = []
+    best_val_f1 = -np.inf
+    patience_counter = 0
+
+    checkpoint_path = (
+        OUTPUT_DIR
+        / f"{experiment_name}_seed{seed}_best.pt"
+    )
+
+    for epoch in range(1, NUM_EPOCHS + 1):
+        set_epoch_lr(epoch)
+
+        train_stats = train_one_epoch(
+            model,
+            train_loader,
+            optimizer,
+            scaler,
+            class_weights=class_weights,
+            epoch=epoch,
+        )
+
+        val_result = evaluate(
+            model,
+            val_loader,
+            split_name=f"Validation epoch {epoch}",
+        )
+
+        val_f1 = val_result["metrics"]["macro_f1"]
+
+        history.append({
+            "epoch": epoch,
+            "lr": optimizer.param_groups[0]["lr"],
+            "text_lr": optimizer.param_groups[1]["lr"],
+            **{
+                f"train_{k}": v
+                for k, v in train_stats.items()
+            },
+            **{
+                f"val_{k}": v
+                for k, v in val_result["metrics"].items()
+            },
+        })
+
+        print(
+            f"\nEpoch {epoch:03d} | "
+            f"Train Acc={train_stats['accuracy']:.2f}% | "
+            f"Val Acc={val_result['metrics']['accuracy']*100:.2f}% | "
+            f"Val Macro-F1={val_f1:.4f}"
+        )
+
+        if val_f1 > best_val_f1:
+            best_val_f1 = val_f1
+            patience_counter = 0
+
+            torch.save(
+                {
+                    "model_state": model.state_dict(),
+                    "seed": seed,
+                    "epoch": epoch,
+                    "best_val_macro_f1": best_val_f1,
+                    "config": {
+                        "use_roi": use_roi,
+                        "use_language": use_language,
+                        "use_region_dropout": use_region_dropout,
+                        "split_protocol": "global duplicate-aware image-level approximately 80/10/10",
+                        "pretrained_visual_model": False,
+                        "pretrained_language_model": False,
+                        "training_mode": "entire_model_from_scratch",
+                        "use_tta": USE_TTA,
+                    },
+                },
+                checkpoint_path,
+            )
+
+            print(f"Saved best checkpoint: {checkpoint_path}")
+        else:
+            patience_counter += 1
+
+        if patience_counter >= EARLY_STOPPING_PATIENCE:
+            print(f"Early stopping at epoch {epoch}.")
+            break
+
+    save_history(
+        history,
+        OUTPUT_DIR
+        / f"{experiment_name}_seed{seed}_history.csv",
+    )
+
+    # PyTorch 2.6+ defaults torch.load(..., weights_only=True).
+    # This checkpoint was created by this trusted training script and
+    # contains NumPy scalar metadata, so weights_only=True cannot unpickle it.
+    # Load the trusted checkpoint with the legacy/full pickle behavior.
+    try:
+        checkpoint = torch.load(
+            checkpoint_path,
+            map_location=DEVICE,
+            weights_only=False,
+        )
+    except TypeError:
+        # Compatibility with older PyTorch versions that do not expose
+        # the weights_only argument.
+        checkpoint = torch.load(
+            checkpoint_path,
+            map_location=DEVICE,
+        )
+
+    model.load_state_dict(checkpoint["model_state"])
+
+    train_result = evaluate(
+        model,
+        DataLoader(
+            train_dataset,
+            batch_size=BATCH_SIZE,
+            shuffle=False,
+            num_workers=NUM_WORKERS,
+        ),
+        "Train",
+    )
+
+    val_result = evaluate(model, val_loader, "Validation")
+
+    # Copy the validation-selected model to a seed-specific checkpoint.
+    # The test split is intentionally not evaluated inside this function.
+    checkpoint_copy = OUTPUT_DIR / f"{experiment_name}_selected.pt"
+    torch.save({
+        "model_state": model.state_dict(),
+        "seed": seed,
+        "best_val_macro_f1": best_val_f1,
+        "config": {
+            "split_protocol": "global duplicate-aware image-level approximately 80/10/10",
+            "pretrained_visual_model": False,
+            "pretrained_language_model": False,
+            "training_mode": "entire_model_from_scratch",
+            "use_tta": USE_TTA,
+        },
+    }, checkpoint_copy)
+
+    summary = {
+        "experiment": experiment_name,
+        "seed": seed,
+        "split_protocol": "global duplicate-aware image-level approximately 80/10/10",
+        "pretrained_visual_model": False,
+        "pretrained_language_model": False,
+        "training_mode": "entire_model_from_scratch",
+        "use_tta": USE_TTA,
+        "total_parameters_m": total_params / 1e6,
+        "trainable_parameters_m": trainable_params / 1e6,
+        "frozen_parameters_m": frozen_params / 1e6,
+        "non_parameter_buffers_m": param_report["non_parameter_buffers"] / 1e6,
+        "best_val_macro_f1": best_val_f1,
+        "selected_checkpoint": str(checkpoint_copy),
+        "test_evaluated_after_training": False,
+    }
+
+    with open(
+        OUTPUT_DIR
+        / f"{experiment_name}_seed{seed}_summary.json",
+        "w",
+    ) as f:
+        json.dump(summary, f, indent=2)
+
+    return summary
+
+
+# ================================================================
+# 20. ABLATION STUDIES
+# ================================================================
+
+def run_ablation_suite(splits, seed=42):
+    """Train all four configurations for one matched random seed."""
+    experiments = [
+        {
+            "name": "full_model",
+            "use_roi": True,
+            "use_language": True,
+            "use_region_dropout": True,
+        },
+        {
+            "name": "ablation_no_roi",
+            "use_roi": False,
+            "use_language": True,
+            "use_region_dropout": True,
+        },
+        {
+            "name": "ablation_no_language",
+            "use_roi": True,
+            "use_language": False,
+            "use_region_dropout": True,
+        },
+        {
+            "name": "ablation_no_region_dropout",
+            "use_roi": True,
+            "use_language": True,
+            "use_region_dropout": False,
+        },
+    ]
+
+    results = []
+
+    for exp in experiments:
+        print("\n" + "-" * 80)
+        print(f"Ablation: {exp['name']} | seed={seed}")
+        print("-" * 80)
+
+        result = run_experiment(
+            seed=seed,
+            experiment_name=f"{exp['name']}_seed{seed}",
+            use_roi=exp["use_roi"],
+            use_language=exp["use_language"],
+            use_region_dropout=exp["use_region_dropout"],
+            splits=splits,
+        )
+        results.append(result)
+
+    df = pd.DataFrame(results)
+    df.to_csv(
+        OUTPUT_DIR / f"ablation_results_seed{seed}.csv",
+        index=False,
+    )
+    return df
+
+
+# ================================================================
+# 21. VALIDATION-SELECTED SCRATCH ENSEMBLE TEST EVALUATION
+# ================================================================
+
+@torch.no_grad()
+def evaluate_ensemble(model, checkpoints, loader, split_name="Test Ensemble"):
+    model.eval()
+    all_probs, all_labels, all_filenames, all_paths = [], [], [], []
+    states = []
+    for ckpt_path in checkpoints:
+        ckpt = torch.load(ckpt_path, map_location=DEVICE, weights_only=False)
+        states.append(ckpt["model_state"])
+
+    for batch in tqdm(loader, desc=f"Evaluating {split_name}", leave=False):
+        image = batch["image"].to(DEVICE, non_blocking=True)
+        labels = batch["label"].cpu().numpy()
+        seed_probs = []
+        variants = [image]
+        if USE_TTA:
+            variants += [
+                torch.roll(image, shifts=(2, 0), dims=(2, 3)),
+                torch.roll(image, shifts=(-2, 0), dims=(2, 3)),
+                torch.roll(image, shifts=(0, 2), dims=(2, 3)),
+                torch.roll(image, shifts=(0, -2), dims=(2, 3)),
+            ]
+        for state in states:
+            model.load_state_dict(state)
+            probs_for_seed = []
+            for v in variants:
+                probs_for_seed.append(F.softmax(model(v)["logits"], dim=1))
+            seed_probs.append(torch.stack(probs_for_seed).mean(dim=0))
+        probs = torch.stack(seed_probs).mean(dim=0)
+        all_probs.append(probs.cpu().numpy())
+        all_labels.extend(labels)
+        all_filenames.extend(list(batch["filename"]))
+        all_paths.extend(list(batch["path"]))
+
+    probs = np.concatenate(all_probs, axis=0)
+    y_true = np.asarray(all_labels)
+    y_pred = probs.argmax(axis=1)
+    cm = confusion_matrix(y_true, y_pred, labels=np.arange(len(CLASS_NAMES)))
+    precision, recall, f1, support = precision_recall_fscore_support(
+        y_true, y_pred, labels=np.arange(len(CLASS_NAMES)), zero_division=0
+    )
+    specificity = []
+    for i in range(len(CLASS_NAMES)):
+        tp = cm[i, i]
+        fn = cm[i, :].sum() - tp
+        fp = cm[:, i].sum() - tp
+        tn = cm.sum() - tp - fn - fp
+        specificity.append(tn / (tn + fp) if (tn + fp) else 0.0)
+    specificity = np.asarray(specificity)
+    metrics = {
+        "accuracy": accuracy_score(y_true, y_pred),
+        "balanced_accuracy": balanced_accuracy_score(y_true, y_pred),
+        "macro_precision": precision.mean(),
+        "macro_recall": recall.mean(),
+        "macro_f1": f1.mean(),
+        "macro_specificity": specificity.mean(),
+        "cohen_kappa": cohen_kappa_score(y_true, y_pred),
+        "mcc": matthews_corrcoef(y_true, y_pred),
+    }
+    try:
+        metrics["macro_auc_ovr"] = roc_auc_score(y_true, probs, multi_class="ovr", average="macro")
+    except ValueError:
+        metrics["macro_auc_ovr"] = float("nan")
+    print(f"\n===== {split_name} =====")
+    for k, v in metrics.items():
+        print(f"{k}: {v*100:.2f}%" if k in {"accuracy", "balanced_accuracy"} else f"{k}: {v:.4f}")
+    print("\nConfusion matrix:")
+    print(pd.DataFrame(cm, index=CLASS_NAMES, columns=CLASS_NAMES))
+    pred_df = pd.DataFrame({"filename": all_filenames, "path": all_paths, "true_label": y_true, "pred_label": y_pred})
+    for i, name in enumerate(CLASS_NAMES):
+        pred_df[f"prob_{name}"] = probs[:, i]
+    pred_df.to_csv(OUTPUT_DIR / "ensemble_test_predictions.csv", index=False)
+    return metrics, cm
+
+
+
+# ================================================================
+# 22. RESULTS / PAPER FIGURES AND STATISTICS
+# ================================================================
+
+def save_classwise_results(result, output_csv):
+    """Save class-wise precision, recall, F1, specificity and support."""
+    rows = []
+    for i, name in enumerate(CLASS_NAMES):
+        rows.append({
+            "class": name,
+            "precision": float(result["precision"][i]),
+            "recall_sensitivity": float(result["recall"][i]),
+            "specificity": float(result["specificity"][i]),
+            "f1": float(result["f1"][i]),
+        })
+    pd.DataFrame(rows).to_csv(output_csv, index=False)
+
+
+def plot_confusion_matrix(cm, output_path, normalize=True):
+    import matplotlib.pyplot as plt
+
+    mat = cm.astype(float)
+    if normalize:
+        denom = mat.sum(axis=1, keepdims=True)
+        mat = np.divide(mat, denom, out=np.zeros_like(mat), where=denom != 0)
+
+    fig, ax = plt.subplots(figsize=(5.2, 4.4))
+    im = ax.imshow(mat)
+    ax.set_xticks(range(len(CLASS_NAMES)), CLASS_NAMES)
+    ax.set_yticks(range(len(CLASS_NAMES)), CLASS_NAMES)
+    ax.set_xlabel("Predicted class")
+    ax.set_ylabel("True class")
+    ax.set_title("Normalized Confusion Matrix")
+
+    for i in range(len(CLASS_NAMES)):
+        for j in range(len(CLASS_NAMES)):
+            text_value = f"{mat[i, j]*100:.1f}%" if normalize else str(cm[i, j])
+            ax.text(j, i, text_value, ha="center", va="center")
+
+    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_multiclass_roc(y_true, probs, output_path):
+    """One-vs-rest ROC curves with per-class AUC and macro AUC."""
+    import matplotlib.pyplot as plt
+    from sklearn.preprocessing import label_binarize
+
+    y_bin = label_binarize(y_true, classes=np.arange(len(CLASS_NAMES)))
+
+    fig, ax = plt.subplots(figsize=(6, 5))
+    aucs = {}
+    for i, name in enumerate(CLASS_NAMES):
+        fpr, tpr, _ = roc_curve(y_bin[:, i], probs[:, i])
+        class_auc = auc(fpr, tpr)
+        aucs[name] = class_auc
+        ax.plot(fpr, tpr, label=f"{name} (AUC={class_auc:.4f})")
+
+    try:
+        macro_auc = roc_auc_score(
+            y_true, probs, multi_class="ovr", average="macro"
+        )
+    except ValueError:
+        macro_auc = float("nan")
+
+    ax.plot([0, 1], [0, 1], linestyle="--")
+    ax.set_xlabel("False Positive Rate")
+    ax.set_ylabel("True Positive Rate")
+    ax.set_title("One-vs-Rest ROC Curves")
+    ax.legend(loc="lower right")
+    ax.grid(alpha=0.25)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+    pd.DataFrame({
+        "class": list(aucs.keys()),
+        "auc": list(aucs.values())
+    }).to_csv(Path(output_path).with_suffix(".csv"), index=False)
+
+    return aucs, macro_auc
+
+
+def bootstrap_confidence_intervals(y_true, probs, n_bootstrap=2000, seed=2026):
+    """Nonparametric 95% bootstrap CIs for final held-out test metrics."""
+    rng = np.random.RandomState(seed)
+    y_true = np.asarray(y_true)
+    probs = np.asarray(probs)
+    n = len(y_true)
+    pred = probs.argmax(axis=1)
+
+    def metrics_for_indices(idx):
+        yt = y_true[idx]
+        pp = probs[idx]
+        yp = pp.argmax(axis=1)
+
+        precision, recall, f1, _ = precision_recall_fscore_support(
+            yt, yp, labels=np.arange(len(CLASS_NAMES)), zero_division=0
+        )
+
+        cm = confusion_matrix(
+            yt, yp, labels=np.arange(len(CLASS_NAMES))
+        )
+        specificity = []
+        for i in range(len(CLASS_NAMES)):
+            tp = cm[i, i]
+            fn = cm[i, :].sum() - tp
+            fp = cm[:, i].sum() - tp
+            tn = cm.sum() - tp - fn - fp
+            specificity.append(tn / (tn + fp) if (tn + fp) else 0.0)
+
+        try:
+            auc_value = roc_auc_score(
+                yt, pp, multi_class="ovr", average="macro"
+            )
+        except ValueError:
+            auc_value = np.nan
+
+        return {
+            "accuracy": accuracy_score(yt, yp),
+            "balanced_accuracy": balanced_accuracy_score(yt, yp),
+            "macro_precision": precision.mean(),
+            "macro_recall": recall.mean(),
+            "macro_f1": f1.mean(),
+            "macro_specificity": np.mean(specificity),
+            "macro_auc_ovr": auc_value,
+        }
+
+    point = metrics_for_indices(np.arange(n))
+    samples = {k: [] for k in point}
+
+    for _ in range(n_bootstrap):
+        idx = rng.randint(0, n, size=n)
+        m = metrics_for_indices(idx)
+        for k, v in m.items():
+            if np.isfinite(v):
+                samples[k].append(v)
+
+    rows = []
+    for k, point_value in point.items():
+        vals = np.asarray(samples[k], dtype=float)
+        if len(vals):
+            lo, hi = np.percentile(vals, [2.5, 97.5])
+        else:
+            lo, hi = np.nan, np.nan
+        rows.append({
+            "metric": k,
+            "estimate": point_value,
+            "ci95_lower": lo,
+            "ci95_upper": hi,
+        })
+
+    return pd.DataFrame(rows)
+
+
+def evaluate_single_checkpoint_with_tta(model, checkpoint_path, loader):
+    """Evaluate one selected seed checkpoint on the held-out test set."""
+    ckpt = torch.load(
+        checkpoint_path, map_location=DEVICE, weights_only=False
+    )
+    model.load_state_dict(ckpt["model_state"])
+    return evaluate_with_tta(
+        model, loader, split_name=f"Test seed {ckpt.get('seed', 'NA')}"
+    )
+
+
+def save_training_seed_summary(seed_results, output_csv):
+    """Mean ± SD across independently initialized selected checkpoints."""
+    rows = []
+    metric_names = [
+        "accuracy", "balanced_accuracy", "macro_precision",
+        "macro_recall", "macro_f1", "macro_specificity",
+        "macro_auc_ovr", "cohen_kappa", "mcc"
+    ]
+    for metric in metric_names:
+        vals = [r["metrics"][metric] for r in seed_results]
+        rows.append({
+            "metric": metric,
+            "mean": float(np.mean(vals)),
+            "sd": float(np.std(vals, ddof=1)) if len(vals) > 1 else 0.0,
+            "n_seeds": len(vals),
+        })
+    pd.DataFrame(rows).to_csv(output_csv, index=False)
+
+
+def benchmark_inference(model, loader, checkpoints, warmup=5, repeats=30):
+    """
+    Report parameter count and single-model inference latency.
+    Latency is measured on one representative batch using the selected
+    architecture; it is not used for model selection.
+    """
+    ckpt = torch.load(
+        checkpoints[0], map_location=DEVICE, weights_only=False
+    )
+    model.load_state_dict(ckpt["model_state"])
+    model.eval()
+
+    batch = next(iter(loader))
+    image = batch["image"].to(DEVICE, non_blocking=True)
+
+    with torch.no_grad():
+        for _ in range(warmup):
+            _ = model(image)
+        if DEVICE.type == "cuda":
+            torch.cuda.synchronize()
+
+        t0 = time.perf_counter()
+        for _ in range(repeats):
+            _ = model(image)
+        if DEVICE.type == "cuda":
+            torch.cuda.synchronize()
+        elapsed = time.perf_counter() - t0
+
+    ms_per_batch = 1000.0 * elapsed / repeats
+    ms_per_image = ms_per_batch / image.shape[0]
+
+    return {
+        "batch_size": int(image.shape[0]),
+        "inference_ms_per_batch": ms_per_batch,
+        "inference_ms_per_image": ms_per_image,
+        "images_per_second": 1000.0 / ms_per_image,
+    }
+
+
+class GradCAM:
+    """
+    Grad-CAM for the proposed visual encoder.
+
+    Target layer:
+        visual_encoder.scale28_proj
+
+    This produces a 28x28 spatial activation map before the transformer
+    tokenization pathway. The resulting CAM is upsampled to 224x224.
+
+    The accompanying faithfulness score is a confidence-drop score:
+        original target-class probability
+        minus probability after masking the top 20% CAM pixels.
+
+    No anatomical ground-truth masks are assumed, so IoU/Dice are NOT
+    reported for Grad-CAM unless independent ROI annotations are available.
+    """
+    def __init__(self, model, target_layer):
+        self.model = model
+        self.target_layer = target_layer
+        self.activations = None
+        self.gradients = None
+
+        self.forward_handle = target_layer.register_forward_hook(
+            self._forward_hook
+        )
+        self.backward_handle = target_layer.register_full_backward_hook(
+            self._backward_hook
+        )
+
+    def _forward_hook(self, module, inputs, output):
+        self.activations = output
+
+    def _backward_hook(self, module, grad_input, grad_output):
+        self.gradients = grad_output[0]
+
+    def remove(self):
+        self.forward_handle.remove()
+        self.backward_handle.remove()
+
+    def __call__(self, image, target_class=None):
+        self.model.zero_grad(set_to_none=True)
+        out = self.model(image)
+        logits = out["logits"]
+
+        if target_class is None:
+            target_class = int(logits.argmax(dim=1)[0].item())
+
+        score = logits[:, target_class].sum()
+        score.backward()
+
+        activations = self.activations
+        gradients = self.gradients
+
+        weights = gradients.mean(dim=(-2, -1), keepdim=True)
+        cam = (weights * activations).sum(dim=1, keepdim=True)
+        cam = F.relu(cam)
+
+        cam = F.interpolate(
+            cam, size=image.shape[-2:], mode="bilinear", align_corners=False
+        )
+
+        cam_min = cam.amin(dim=(-2, -1), keepdim=True)
+        cam_max = cam.amax(dim=(-2, -1), keepdim=True)
+        cam = (cam - cam_min) / (cam_max - cam_min + 1e-8)
+
+        probabilities = F.softmax(logits.detach(), dim=1)
+        return cam.detach(), probabilities.detach(), target_class
+
+
+def compute_gradcam_faithfulness(model, image, cam, target_class,
+                                  top_fraction=0.20):
+    """
+    Confidence-drop faithfulness score in percentage points.
+    Higher values mean the highlighted CAM pixels contribute more to
+    the model's target-class confidence.
+
+    The image is normalized with mean/std=0.5, so zero corresponds to
+    the normalization midpoint used as the masking value.
+    """
+    model.eval()
+    with torch.no_grad():
+        original_prob = F.softmax(model(image)["logits"], dim=1)[
+            0, target_class
+        ].item()
+
+        flat = cam.flatten(1)
+        k = max(1, int(flat.shape[1] * top_fraction))
+        top_idx = torch.topk(flat, k=k, dim=1).indices
+
+        masked = image.clone()
+        masked_flat = masked.view(masked.shape[0], masked.shape[1], -1)
+
+        for c in range(masked_flat.shape[1]):
+            masked_flat[:, c, top_idx[0]] = 0.0
+
+        masked = masked_flat.view_as(image)
+        masked_prob = F.softmax(model(masked)["logits"], dim=1)[
+            0, target_class
+        ].item()
+
+    return {
+        "original_target_probability": original_prob,
+        "masked_target_probability": masked_prob,
+        "confidence_drop": original_prob - masked_prob,
+        "confidence_drop_percent": 100.0 * (original_prob - masked_prob),
+    }
+
+
+def save_gradcam_visualizations(model, dataset, output_dir,
+                                n_examples_per_class=4,
+                                top_fraction=0.20):
+    """
+    Save representative AD/CN/MCI Grad-CAM visualizations and a
+    quantitative faithfulness CSV.
+    """
+    import matplotlib.pyplot as plt
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Select deterministic representative cases from the held-out test set:
+    # at least one correct and one incorrect case per class when available.
+    pred_csv = output_dir.parent / "ensemble_test_predictions.csv"
+    pred_lookup = {}
+    if pred_csv.exists():
+        pred_table = pd.read_csv(pred_csv)
+        for _, row in pred_table.iterrows():
+            pred_lookup[str(row["path"])] = int(row["pred_label"])
+
+    selected = []
+    selected_tags = {}
+    for class_idx, class_name in enumerate(CLASS_NAMES):
+        class_indices = [
+            i for i, label in enumerate(dataset.labels)
+            if int(label) == class_idx
+        ]
+        correct = [
+            i for i in class_indices
+            if pred_lookup.get(str(dataset.paths[i]), -1) == class_idx
+        ]
+        incorrect = [
+            i for i in class_indices
+            if i not in correct
+        ]
+        candidates = []
+        if correct:
+            candidates.append((correct[0], "correct"))
+        if incorrect:
+            candidates.append((incorrect[0], "incorrect"))
+        for i, tag in candidates:
+            if i not in selected:
+                selected.append(i)
+                selected_tags[i] = tag
+        # Fill remaining slots deterministically.
+        for i in class_indices:
+            if len([j for j in selected if int(dataset.labels[j]) == class_idx]) >= n_examples_per_class:
+                break
+            if i not in selected:
+                selected.append(i)
+                selected_tags[i] = "representative"
+
+    target_layer = model.visual_encoder.scale28_proj
+    cam_extractor = GradCAM(model, target_layer)
+    rows = []
+
+    try:
+        for idx in selected:
+            sample = dataset[idx]
+            image = sample["image"].unsqueeze(0).to(DEVICE)
+
+            # Grad-CAM uses the model's predicted class as the target.
+            cam, probs, predicted_class = cam_extractor(
+                image, target_class=None
+            )
+
+            faith = compute_gradcam_faithfulness(
+                model, image, cam, predicted_class,
+                top_fraction=top_fraction
+            )
+
+            cam_np = cam[0, 0].cpu().numpy()
+            base = sample["image"].permute(1, 2, 0).cpu().numpy()
+            base = np.clip(base * 0.5 + 0.5, 0, 1)
+
+            fig, axes = plt.subplots(1, 3, figsize=(10, 3.2))
+            axes[0].imshow(base)
+            case_tag = selected_tags.get(idx, "representative")
+            axes[0].set_title(
+                f"True: {CLASS_NAMES[int(sample['label'])]}\n{case_tag}"
+            )
+            axes[0].axis("off")
+
+            axes[1].imshow(base)
+            axes[1].imshow(cam_np, alpha=0.45)
+            axes[1].set_title(
+                f"Grad-CAM: {CLASS_NAMES[predicted_class]}"
+            )
+            axes[1].axis("off")
+
+            axes[2].imshow(cam_np)
+            axes[2].set_title(
+                f"Drop: {faith['confidence_drop_percent']:.2f} pp"
+            )
+            axes[2].axis("off")
+
+            fig.tight_layout()
+            fig.savefig(
+                output_dir / f"{idx:04d}_{Path(sample['filename']).stem}_gradcam.png",
+                dpi=300,
+                bbox_inches="tight",
+            )
+            plt.close(fig)
+
+            rows.append({
+                "index": idx,
+                "filename": sample["filename"],
+                "true_class": CLASS_NAMES[int(sample["label"])],
+                "predicted_class": CLASS_NAMES[predicted_class],
+                "case_type": case_tag,
+                "target_probability": float(probs[0, predicted_class]),
+                **faith,
+            })
+    finally:
+        cam_extractor.remove()
+
+    df = pd.DataFrame(rows)
+    df.to_csv(output_dir / "gradcam_faithfulness.csv", index=False)
+
+    if len(df):
+        summary = (
+            df.groupby("true_class")["confidence_drop_percent"]
+            .agg(["mean", "std", "median", "count"])
+            .reset_index()
+        )
+        summary.to_csv(
+            output_dir / "gradcam_faithfulness_by_class.csv",
+            index=False,
+        )
+
+    return df
+
+
+def run_results_suite(model, checkpoints, test_loader, test_dataset,
+                      output_dir):
+    """
+    Generate all result artifacts required for Sections A and C-H:
+      - ensemble metrics
+      - confusion matrix
+      - ROC
+      - class-wise table
+      - 95% bootstrap CIs
+      - individual-seed robustness
+      - counterfactual evidence
+      - ROI visualizations
+      - Grad-CAM + confidence-drop faithfulness
+      - complexity/inference timing
+    """
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Final ensemble test evaluation.
+    metrics, cm = evaluate_ensemble(
+        model,
+        checkpoints,
+        test_loader,
+        "Test (fixed split + scratch ensemble + fixed TTA)",
+    )
+
+    # Reconstruct predictions saved by evaluate_ensemble.
+    pred_df = pd.read_csv(output_dir / "ensemble_test_predictions.csv")
+    y_true = pred_df["true_label"].to_numpy()
+    probs = pred_df[[f"prob_{c}" for c in CLASS_NAMES]].to_numpy()
+    y_pred = pred_df["pred_label"].to_numpy()
+
+    # A. Overall performance artifacts.
+    overall_df = pd.DataFrame([
+        {"metric": k, "value": float(v)}
+        for k, v in metrics.items()
+    ])
+    overall_df.to_csv(output_dir / "overall_test_metrics.csv", index=False)
+
+    plot_confusion_matrix(
+        cm, output_dir / "confusion_matrix_normalized.png", normalize=True
+    )
+    plot_multiclass_roc(
+        y_true, probs, output_dir / "multiclass_roc.png"
+    )
+
+    # C. Class-wise analysis.
+    precision, recall, f1, support = precision_recall_fscore_support(
+        y_true, y_pred, labels=np.arange(len(CLASS_NAMES)), zero_division=0
+    )
+    specificity = []
+    for i in range(len(CLASS_NAMES)):
+        tp = cm[i, i]
+        fn = cm[i, :].sum() - tp
+        fp = cm[:, i].sum() - tp
+        tn = cm.sum() - tp - fn - fp
+        specificity.append(tn / (tn + fp) if (tn + fp) else 0.0)
+
+    classwise = pd.DataFrame({
+        "class": CLASS_NAMES,
+        "precision": precision,
+        "sensitivity_recall": recall,
+        "specificity": specificity,
+        "f1": f1,
+        "support": support,
+    })
+    classwise.to_csv(output_dir / "classwise_test_metrics.csv", index=False)
+
+    # F. 95% bootstrap confidence intervals on the final ensemble.
+    ci_df = bootstrap_confidence_intervals(
+        y_true, probs, n_bootstrap=2000, seed=2026
+    )
+    ci_df.to_csv(output_dir / "final_test_bootstrap_95CI.csv", index=False)
+
+    # E. Anatomical counterfactual evidence.
+    _, cf_summary = evaluate_counterfactual_evidence(
+        model,
+        test_loader,
+        output_dir / "counterfactual_evidence.csv",
+    )
+    cf_summary.to_csv(
+        output_dir / "counterfactual_evidence_summary.csv", index=False
+    )
+
+    save_roi_visualizations(
+        model,
+        test_dataset,
+        output_dir / "roi_visualizations",
+        n_examples=12,
+    )
+
+    # I. Grad-CAM and quantitative confidence-drop score.
+    gradcam_df = save_gradcam_visualizations(
+        model,
+        test_dataset,
+        output_dir / "gradcam",
+        n_examples_per_class=4,
+        top_fraction=0.20,
+    )
+
+    # G. Complexity and efficiency.
+    complexity = count_model_state(model)
+    timing = benchmark_inference(
+        model, test_loader, checkpoints, warmup=5, repeats=30
+    )
+    complexity_row = {
+        "total_parameters_m": complexity["total_parameters"] / 1e6,
+        "trainable_parameters_m": complexity["trainable_parameters"] / 1e6,
+        "frozen_parameters_m": complexity["frozen_parameters"] / 1e6,
+        "trainable_percent": complexity["trainable_percent"],
+        **timing,
+    }
+    pd.DataFrame([complexity_row]).to_csv(
+        output_dir / "model_complexity_and_inference.csv", index=False
+    )
+
+    return {
+        "metrics": metrics,
+        "cm": cm,
+        "classwise": classwise,
+        "ci": ci_df,
+        "counterfactual_summary": cf_summary,
+        "gradcam": gradcam_df,
+        "complexity": complexity_row,
+    }
+
+
+# ================================================================
+# 22. NON-PARAMETRIC STATISTICAL ANALYSIS
+# ================================================================
+
+STAT_METRICS = [
+    "accuracy",
+    "balanced_accuracy",
+    "macro_precision",
+    "macro_recall",
+    "macro_f1",
+    "macro_specificity",
+    "macro_auc_ovr",
+    "cohen_kappa",
+    "mcc",
+]
+
+
+def _holm_adjust(p_values):
+    """Holm step-down correction for a list of p-values."""
+    p = np.asarray(p_values, dtype=float)
+    adjusted = np.full_like(p, np.nan)
+    valid = np.isfinite(p)
+    idx = np.where(valid)[0]
+    if len(idx) == 0:
+        return adjusted
+    order = idx[np.argsort(p[idx])]
+    m = len(order)
+    running = 0.0
+    for rank, original_idx in enumerate(order):
+        value = min(1.0, (m - rank) * p[original_idx])
+        running = max(running, value)
+        adjusted[original_idx] = running
+    return adjusted
+
+
+def perform_wilcoxon_tests(ablation_df, output_dir, metrics=None):
+    """
+    Pairwise Wilcoxon signed-rank tests using the same random seeds for
+    both configurations. Holm-adjusted p-values are also reported.
+    """
+    metrics = metrics or STAT_METRICS
+    configs = sorted(ablation_df["experiment"].unique().tolist())
+    rows = []
+
+    for metric in metrics:
+        metric_rows = []
+        for i in range(len(configs)):
+            for j in range(i + 1, len(configs)):
+                a_name, b_name = configs[i], configs[j]
+                a = ablation_df[ablation_df.experiment == a_name][["seed", metric]]
+                b = ablation_df[ablation_df.experiment == b_name][["seed", metric]]
+                merged = a.merge(b, on="seed", suffixes=("_a", "_b"))
+                x = merged[f"{metric}_a"].to_numpy(float)
+                y = merged[f"{metric}_b"].to_numpy(float)
+                finite = np.isfinite(x) & np.isfinite(y)
+                x = x[finite]
+                y = y[finite]
+
+                if len(x) < 2:
+                    stat, p = np.nan, np.nan
+                elif np.allclose(x, y):
+                    stat, p = 0.0, 1.0
+                else:
+                    test = wilcoxon(x, y, alternative="two-sided", zero_method="wilcox", method="auto")
+                    stat, p = float(test.statistic), float(test.pvalue)
+
+                metric_rows.append({
+                    "metric": metric,
+                    "method_A": a_name,
+                    "method_B": b_name,
+                    "n_pairs": len(x),
+                    "wilcoxon_statistic": stat,
+                    "p_value": p,
+                })
+
+        pvals = [r["p_value"] for r in metric_rows]
+        adj = _holm_adjust(pvals)
+        for r, ap in zip(metric_rows, adj):
+            r["p_value_holm"] = float(ap) if np.isfinite(ap) else np.nan
+            r["significant_p05"] = bool(np.isfinite(ap) and ap < 0.05)
+            rows.append(r)
+
+    result = pd.DataFrame(rows)
+    result.to_csv(output_dir / "wilcoxon_signed_rank_results.csv", index=False)
+    return result
+
+
+def perform_kruskal_wallis(ablation_df, output_dir, metrics=None):
+    """Overall Kruskal-Wallis comparison across the four configurations."""
+    metrics = metrics or STAT_METRICS
+    configs = sorted(ablation_df["experiment"].unique().tolist())
+    rows = []
+
+    for metric in metrics:
+        groups = []
+        names = []
+        for config in configs:
+            values = ablation_df.loc[ablation_df.experiment == config, metric].dropna().to_numpy(float)
+            if len(values):
+                groups.append(values)
+                names.append(config)
+
+        if len(groups) >= 2:
+            test = kruskal(*groups, nan_policy="omit")
+            h, p = float(test.statistic), float(test.pvalue)
+        else:
+            h, p = np.nan, np.nan
+
+        rows.append({
+            "metric": metric,
+            "configurations": " | ".join(names),
+            "n_groups": len(groups),
+            "kruskal_H": h,
+            "p_value": p,
+            "significant_p05": bool(np.isfinite(p) and p < 0.05),
+        })
+
+    result = pd.DataFrame(rows)
+    result.to_csv(output_dir / "kruskal_wallis_results.csv", index=False)
+    return result
+
+
+def mcnemar_exact_test(y_true, pred_a, pred_b):
+    """Exact two-sided McNemar test for paired classifier predictions."""
+    y_true = np.asarray(y_true)
+    pred_a = np.asarray(pred_a)
+    pred_b = np.asarray(pred_b)
+
+    correct_a = pred_a == y_true
+    correct_b = pred_b == y_true
+
+    both_correct = int(np.sum(correct_a & correct_b))
+    a_correct_b_wrong = int(np.sum(correct_a & ~correct_b))
+    a_wrong_b_correct = int(np.sum(~correct_a & correct_b))
+    both_wrong = int(np.sum(~correct_a & ~correct_b))
+
+    discordant = a_correct_b_wrong + a_wrong_b_correct
+    if discordant == 0:
+        p = 1.0
+    else:
+        p = float(binomtest(
+            k=min(a_correct_b_wrong, a_wrong_b_correct),
+            n=discordant,
+            p=0.5,
+            alternative="two-sided",
+        ).pvalue)
+
+    return {
+        "both_correct": both_correct,
+        "A_correct_B_wrong": a_correct_b_wrong,
+        "A_wrong_B_correct": a_wrong_b_correct,
+        "both_wrong": both_wrong,
+        "discordant_pairs": discordant,
+        "p_value": p,
+        "significant_p05": p < 0.05,
+    }
+
+
+def collect_ablation_test_predictions(ablation_checkpoints, model, test_loader, output_dir):
+    """
+    Evaluate every ablation configuration/seed on the identical held-out
+    test set. Both individual predictions and test-set metrics are saved.
+    """
+    prediction_records = []
+    metric_records = []
+
+    for seed in sorted(ablation_checkpoints):
+        for config_name, checkpoint_path in ablation_checkpoints[seed].items():
+            result = evaluate_single_checkpoint_with_tta(
+                model, checkpoint_path, test_loader
+            )
+
+            y_true = np.asarray(result["y_true"], dtype=int)
+            y_pred = np.asarray(result["y_pred"], dtype=int)
+            filenames = result.get(
+                "filenames",
+                [f"sample_{i}" for i in range(len(y_true))],
+            )
+            paths = result.get("paths", [""] * len(y_true))
+
+            for i in range(len(y_true)):
+                prediction_records.append({
+                    "seed": int(seed),
+                    "experiment": config_name,
+                    "filename": filenames[i],
+                    "path": paths[i],
+                    "y_true": int(y_true[i]),
+                    "y_pred": int(y_pred[i]),
+                })
+
+            metric_row = {
+                "seed": int(seed),
+                "experiment": config_name,
+            }
+            metric_row.update({
+                k: float(v) for k, v in result["metrics"].items()
+            })
+            metric_records.append(metric_row)
+
+    prediction_df = pd.DataFrame(prediction_records)
+    metric_df = pd.DataFrame(metric_records)
+
+    prediction_df.to_csv(
+        output_dir / "ablation_test_predictions.csv",
+        index=False,
+    )
+    metric_df.to_csv(
+        output_dir / "ablation_test_metrics.csv",
+        index=False,
+    )
+
+    return prediction_df, metric_df
+
+
+def perform_mcnemar_tests(prediction_df, output_dir):
+    """
+    Exact McNemar tests for all classifier pairs, separately for each seed.
+    Predictions are therefore paired on exactly the same held-out images.
+    """
+    configs = sorted(prediction_df["experiment"].unique().tolist())
+    rows = []
+
+    for seed in sorted(prediction_df["seed"].unique()):
+        sdf = prediction_df[prediction_df.seed == seed].copy()
+        # Full path is used as the pairing key because filenames alone are
+        # not guaranteed to be globally unique across axial/coronal folders.
+        pivot = sdf.pivot(index="path", columns="experiment", values="y_pred")
+        labels = sdf.drop_duplicates("path").set_index("path")["y_true"]
+
+        for i in range(len(configs)):
+            for j in range(i + 1, len(configs)):
+                a_name, b_name = configs[i], configs[j]
+                if a_name not in pivot.columns or b_name not in pivot.columns:
+                    continue
+                common = pivot[[a_name, b_name]].dropna()
+                yt = labels.loc[common.index].to_numpy(int)
+                pa = common[a_name].to_numpy(int)
+                pb = common[b_name].to_numpy(int)
+                test = mcnemar_exact_test(yt, pa, pb)
+                rows.append({
+                    "seed": int(seed),
+                    "method_A": a_name,
+                    "method_B": b_name,
+                    "n_test_samples": len(common),
+                    **test,
+                })
+
+    result = pd.DataFrame(rows)
+    result.to_csv(output_dir / "mcnemar_results.csv", index=False)
+    return result
+
+
+# ================================================================
+# 23. MAIN
+# ================================================================
+
+if __name__ == "__main__":
+    print("=" * 80)
+    print("ANATOMY-GROUNDED VISION-LANGUAGE REASONING FOR AD STAGING")
+    print("STATISTICAL ABLATION EXPERIMENT")
+    print("=" * 80)
+    print(f"Device: {DEVICE}")
+    print(f"Axial folder: {AXIAL_DIR}")
+    print(f"Coronal folder: {CORONAL_DIR}")
+    print("Split: ONE fixed global duplicate-aware image-level ~80% / 10% / 10% split")
+    print("Axial and coronal images are NOT paired.")
+    print("Entire model is trained from scratch; no pretrained weights.")
+    print(f"Matched statistical seeds: {RUN_SEEDS}")
+    print("Tests: Wilcoxon signed-rank + Kruskal-Wallis + exact McNemar")
+    print("=" * 80)
+
+    SPLIT_SEED = 42
+    seed_everything(SPLIT_SEED)
+
+    # ------------------------------------------------------------
+    # A. ONE AUTHORITATIVE GLOBAL SPLIT
+    # ------------------------------------------------------------
+    fixed_combined_split = load_combined_duplicate_safe_split(
+        AXIAL_DIR,
+        CORONAL_DIR,
+        seed=SPLIT_SEED,
+    )
+    fixed_splits = fixed_combined_split
+
+    modality_counts = count_modalities_in_split(fixed_combined_split)
+    print("\n===== FIXED DATA SPLIT =====")
+    for split_name in ("train", "val", "test"):
+        c = modality_counts[split_name]
+        print(
+            f"{split_name.capitalize():<6}: "
+            f"axial={c['axial']}, coronal={c['coronal']}, combined={c['combined']}"
+        )
+
+    manifest_rows = []
+    for split_name in ("train", "val", "test"):
+        for path, label in zip(
+            fixed_combined_split[f"{split_name}_paths"],
+            fixed_combined_split[f"{split_name}_labels"],
+        ):
+            manifest_rows.append({
+                "split": split_name,
+                "filename": Path(path).name,
+                "path": path,
+                "label": int(label),
+                "class": CLASS_NAMES[int(label)],
+            })
+
+    pd.DataFrame(manifest_rows).to_csv(
+        OUTPUT_DIR / f"FIXED_split_manifest_seed{SPLIT_SEED}.csv",
+        index=False,
+    )
+
+    path_overlaps, duplicate_groups = audit_split_overlap(fixed_combined_split)
+    if duplicate_groups:
+        raise RuntimeError(
+            "The global duplicate-aware split still contains cross-split duplicates. "
+            "Do not train/report results until this is resolved."
+        )
+
+    # ------------------------------------------------------------
+    # B. TEST LOADER
+    # ------------------------------------------------------------
+    test_dataset = MRIDataset(
+        fixed_combined_split["test_paths"],
+        fixed_combined_split["test_labels"],
+        train=False,
+    )
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=False,
+        num_workers=NUM_WORKERS,
+        pin_memory=(DEVICE.type == "cuda"),
+        persistent_workers=(NUM_WORKERS > 0),
+    )
+
+    # ------------------------------------------------------------
+    # C. FOUR CONFIGURATIONS x FIVE MATCHED SEEDS
+    # ------------------------------------------------------------
+    # The full model is NOT trained a second time outside the ablation suite.
+    # Its checkpoints are taken directly from the four-configuration experiment.
+    all_ablation_results = []
+
+    for seed in RUN_SEEDS:
+        seed_df = run_ablation_suite(
+            splits=fixed_splits,
+            seed=seed,
+        ).copy()
+        seed_df["seed"] = seed
+        all_ablation_results.append(seed_df)
+
+    ablation_all_df = pd.concat(
+        all_ablation_results,
+        ignore_index=True,
+    )
+
+    ablation_all_df.to_csv(
+        OUTPUT_DIR / "ablation_all_seeds.csv",
+        index=False,
+    )
+
+    print("\n===== ABLATION RESULTS =====")
+    display_cols = [
+        c for c in [
+            "seed", "experiment", "best_val_macro_f1",
+            "selected_checkpoint", "trainable_parameters_m"
+        ] if c in ablation_all_df.columns
+    ]
+    print(ablation_all_df[display_cols].to_string(index=False))
+
+    # ------------------------------------------------------------
+    # D. CHECKPOINT MAP FOR McNEMAR AND FULL-MODEL ROBUSTNESS
+    # ------------------------------------------------------------
+    ablation_checkpoints = {}
+    for seed in RUN_SEEDS:
+        seed_df = ablation_all_df[ablation_all_df["seed"] == seed]
+        ablation_checkpoints[seed] = {
+            row["experiment"].replace(f"_seed{seed}", ""): row["selected_checkpoint"]
+            for _, row in seed_df.iterrows()
+        }
+
+    full_checkpoints = [
+        ablation_checkpoints[seed]["full_model"]
+        for seed in RUN_SEEDS
+    ]
+
+    # ------------------------------------------------------------
+    # E. MODEL INSTANCE USED ONLY FOR CHECKPOINT EVALUATION
+    # ------------------------------------------------------------
+    seed_everything(SPLIT_SEED)
+    semantic_bank = MedicalSemanticBank().to(DEVICE)
+    model = AnatomyGroundedVLModel(
+        semantic_bank=semantic_bank,
+        use_roi=True,
+        use_language=True,
+        use_region_dropout=True,
+    ).to(DEVICE)
+
+    # ------------------------------------------------------------
+    # F. FULL-MODEL TEST ROBUSTNESS ACROSS FIVE SEEDS
+    # ------------------------------------------------------------
+    individual_seed_results = []
+    for ckpt_path in full_checkpoints:
+        individual_seed_results.append(
+            evaluate_single_checkpoint_with_tta(
+                model,
+                ckpt_path,
+                test_loader,
+            )
+        )
+
+    save_training_seed_summary(
+        individual_seed_results,
+        OUTPUT_DIR / "test_seed_robustness_mean_sd.csv",
+    )
+
+    # ------------------------------------------------------------
+    # G. EXISTING FULL-MODEL RESULTS / FIGURES / Grad-CAM
+    # ------------------------------------------------------------
+    result_artifacts = run_results_suite(
+        model=model,
+        checkpoints=full_checkpoints,
+        test_loader=test_loader,
+        test_dataset=test_dataset,
+        output_dir=OUTPUT_DIR,
+    )
+
+
+    # ------------------------------------------------------------
+    # H. TEST-SET STATISTICAL ANALYSIS
+    # ------------------------------------------------------------
+    print("\n" + "=" * 80)
+    print("GENERATING TEST-SET STATISTICAL CSV FILES")
+    print("=" * 80)
+
+    prediction_df, test_metrics_df = collect_ablation_test_predictions(
+        ablation_checkpoints,
+        model,
+        test_loader,
+        OUTPUT_DIR,
+    )
+
+    wilcoxon_df = perform_wilcoxon_tests(
+        test_metrics_df,
+        OUTPUT_DIR,
+        metrics=STAT_METRICS,
+    )
+    kruskal_df = perform_kruskal_wallis(
+        test_metrics_df,
+        OUTPUT_DIR,
+        metrics=STAT_METRICS,
+    )
+    mcnemar_df = perform_mcnemar_tests(
+        prediction_df,
+        OUTPUT_DIR,
+    )
+
+    # ------------------------------------------------------------
+    # I. DISPLAY AND VERIFY ALL STATISTICAL CSV FILES
+    # ------------------------------------------------------------
+    statistical_files = [
+        OUTPUT_DIR / "ablation_test_metrics.csv",
+        OUTPUT_DIR / "ablation_test_predictions.csv",
+        OUTPUT_DIR / "wilcoxon_signed_rank_results.csv",
+        OUTPUT_DIR / "kruskal_wallis_results.csv",
+        OUTPUT_DIR / "mcnemar_results.csv",
+    ]
+
+    print("\n" + "=" * 80)
+    print("STATISTICAL RESULTS — SAVED CSV FILES")
+    print("=" * 80)
+    for csv_path in statistical_files:
+        if not csv_path.exists():
+            raise RuntimeError(f"Expected CSV was not created: {csv_path.resolve()}")
+        print(f"✓ {csv_path.resolve()}")
+
+    print("\n===== ABLATION TEST METRICS =====")
+    print(test_metrics_df.to_string(index=False))
+
+    print("\n===== WILCOXON SIGNED-RANK RESULTS =====")
+    print(wilcoxon_df.to_string(index=False))
+
+    print("\n===== KRUSKAL-WALLIS RESULTS =====")
+    print(kruskal_df.to_string(index=False))
+
+    print("\n===== McNEMAR RESULTS =====")
+    print(mcnemar_df.to_string(index=False))
+
+    print("\nAll statistical CSV files have been successfully generated in:")
+    print(OUTPUT_DIR.resolve())
+
+
+    # ------------------------------------------------------------
+    # K. SUMMARY JSON
+    # ------------------------------------------------------------
+    final_param_report = count_model_state(model)
+
+    summary = {
+        "split_seed": SPLIT_SEED,
+        "training_seeds": RUN_SEEDS,
+        "split_protocol": "single fixed independent image-level 80/10/10",
+        "axial_coronal_pairing": False,
+        "pretrained_visual_model": False,
+        "pretrained_language_model": False,
+        "training_mode": "entire_model_from_scratch",
+        "use_tta": USE_TTA,
+        "statistical_tests": [
+            "Wilcoxon signed-rank",
+            "Kruskal-Wallis",
+            "exact McNemar",
+        ],
+        "n_matched_seeds": len(RUN_SEEDS),
+        "n_ablation_configurations": 4,
+        "total_parameters_m": final_param_report["total_parameters"] / 1e6,
+        "trainable_parameters_m": final_param_report["trainable_parameters"] / 1e6,
+        "frozen_parameters_m": final_param_report["frozen_parameters"] / 1e6,
+        "non_parameter_buffers_m": final_param_report["non_parameter_buffers"] / 1e6,
+        **{
+            f"test_{k}": float(v)
+            for k, v in result_artifacts["metrics"].items()
+        },
+    }
+
+    with open(
+        OUTPUT_DIR / "TRANSACTIONS_results_summary.json",
+        "w",
+    ) as f:
+        json.dump(summary, f, indent=2)
+
+    print("\n===== OUTPUT DIRECTORY CONTENTS =====")
+    for p in sorted(OUTPUT_DIR.glob("*.csv")):
+        print(f"✓ {p.resolve()}")
+
+    print("\n===== TRANSACTIONS RESULTS SUMMARY =====")
+    print(json.dumps(summary, indent=2))
